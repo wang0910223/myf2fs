@@ -1,0 +1,7 @@
+*.o
+*.ko
+*.cmd
+*.o.cmd
+*.mod.o
+*.mod.c
+*.mod

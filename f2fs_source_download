@@ -1,0 +1,13 @@
+# 1. 下載 Linux 6.8 官方原始碼壓縮檔 (約 130MB，下載很快)
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.8.tar.xz
+
+# 2. 神奇指令：告訴 tar 我們「只要」解壓縮 fs/f2fs 這個資料夾！
+tar -xvf linux-6.8.tar.xz linux-6.8/fs/f2fs
+
+# 3. 把抽出來的 f2fs 目錄重新命名為我們的工作目錄 myf2fs_dev
+mv linux-6.8/fs/f2fs ~/myf2fs_dev
+
+# 4. 清理用不到的壓縮檔和空資料夾
+rm linux-6.8.tar.xz
+rmdir linux-6.8/fs 2>/dev/null || true
+rmdir linux-6.8 2>/dev/null || true
