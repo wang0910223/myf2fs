@@ -4500,6 +4500,11 @@ static inline bool f2fs_hw_should_discard(struct f2fs_sb_info *sbi)
 
 static inline bool f2fs_bdev_support_discard(struct block_device *bdev)
 {
+	/* 🚨 CXL DAX 防彈衣：如果 bdev 是 NULL (純記憶體)，直接回傳 false，不需要 TRIM */
+    if (!bdev)
+        return false;
+
+
 	return bdev_max_discard_sectors(bdev) || bdev_is_zoned(bdev);
 }
 

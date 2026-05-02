@@ -1072,6 +1072,7 @@ int f2fs_sync_dirty_inodes(struct f2fs_sb_info *sbi, enum inode_type type,
 	struct f2fs_inode_info *fi;
 	bool is_dir = (type == DIR_INODE);
 	unsigned long ino = 0;
+	int type_count = is_dir ? F2FS_DIRTY_DENTS : F2FS_DIRTY_DATA; // 預先定義帳本類型
 
 	trace_f2fs_sync_dirty_inodes_enter(sbi->sb, is_dir,
 				get_pages(sbi, is_dir ?
@@ -1089,6 +1090,17 @@ retry:
 	head = &sbi->inode_list[type];
 	if (list_empty(head)) {
 		spin_unlock(&sbi->inode_lock[type]);
+		/* ========================================================= */
+        /* 🚨 CXL DAX MOD: 終極雙重記帳校正回歸 (打破老闆的無限迴圈) 🚨 */
+        /* 當員工發現清單已經空了，但老闆的帳本還有記錄時，強制清零 */
+        /* ========================================================= */
+        if (unlikely(get_pages(sbi, type_count) > 0)) {
+            printk_ratelimited(KERN_WARNING "F2FS-CXL: Fixing F2FS global accounting mismatch! List is empty but counter > 0\n");
+            while (get_pages(sbi, type_count) > 0) {
+                dec_page_count(sbi, type_count);
+            }
+        }
+        /* ========================================================= */
 		trace_f2fs_sync_dirty_inodes_exit(sbi->sb, is_dir,
 				get_pages(sbi, is_dir ?
 				F2FS_DIRTY_DENTS : F2FS_DIRTY_DATA));
@@ -1104,7 +1116,60 @@ retry:
 			F2FS_I(inode)->cp_task = current;
 		F2FS_I(inode)->wb_task = current;
 
+
+		/* ================================================== */
+        /* 🚨 CXL DAX MOD: 終極幽靈清理機制 🚨                */
+        /* ================================================== */
+        int dirty_count = atomic_read(&F2FS_I(inode)->dirty_pages);
+
+        /* 保留監控輸出，建議改用 ratelimited 避免洗頻太嚴重 */
+        printk_ratelimited(KERN_INFO "F2FS-DEBUG: Syncing Inode: %lu, dirty_pages: %d\n", 
+                           inode->i_ino, dirty_count);
+
+        /* 狀況 A：計數器已經是 0，代表資料早寫完了，但清單沒更新 */
+        if (dirty_count == 0) {
+            printk_ratelimited(KERN_WARNING "F2FS-CXL: Ripping out ghost Inode %lu\n", inode->i_ino);
+            
+            /* 🚨 正確寫法：剪斷鐵鍊，如果是目錄才撕標籤 */
+            spin_lock(&sbi->inode_lock[type]);
+            list_del_init(&F2FS_I(inode)->dirty_list);
+            if (is_dir) {
+                clear_inode_flag(inode, FI_DIRTY_DIR);
+            }
+            spin_unlock(&sbi->inode_lock[type]);
+            
+            goto skip_write;
+        }
+
 		filemap_fdatawrite(inode->i_mapping);
+
+		/* * 狀況 B：VFS 根本沒做事！
+         * 因為我們的 CXL 攔截器是「同步 memcpy」，如果有真的發出 BIO，
+         * 狀態一定會在這行之前被清掉。如果計數器完全沒變，代表 VFS 罷工了！
+         */
+        if (dirty_count == atomic_read(&F2FS_I(inode)->dirty_pages)) {
+            printk_ratelimited(KERN_WARNING "F2FS-CXL: Force clearing stuck dirty_pages for Inode %lu\n", inode->i_ino);
+            
+            /* 強制將計數器歸零，打破死鎖！ */
+            atomic_set(&F2FS_I(inode)->dirty_pages, 0);
+
+			/* 2. 同步扣減全域大帳本 (老闆的帳) */
+            while (dirty_count > 0) {
+                dec_page_count(sbi, type_count);
+                dirty_count--;
+            }
+            
+            /* 🚨 正確寫法：剪斷鐵鍊，如果是目錄才撕標籤 */
+            spin_lock(&sbi->inode_lock[type]);
+            list_del_init(&F2FS_I(inode)->dirty_list);
+            if (is_dir) {
+                clear_inode_flag(inode, FI_DIRTY_DIR);
+            }
+            spin_unlock(&sbi->inode_lock[type]);
+        }
+
+skip_write:
+        /* ================================================== */
 
 		F2FS_I(inode)->wb_task = NULL;
 		if (from_cp)
@@ -1123,6 +1188,34 @@ retry:
 		 */
 		f2fs_submit_merged_write(sbi, DATA);
 		cond_resched();
+
+		/* ================================================== */
+        /* 🚨 防線二：強制拔除 igrab(NULL) 的死亡迴圈 🚨      */
+        /* 既然它要死了，我們就幫它從髒清單上解脫，不然會無限迴圈 */
+        /* ================================================== */
+        spin_lock(&sbi->inode_lock[type]);
+        
+        if (!list_empty(&fi->dirty_list)) {
+            printk_ratelimited(KERN_WARNING "F2FS-CXL: Force removing dead igrab(NULL) Inode %lu\n", fi->vfs_inode.i_ino);
+            
+            /* 記錄要扣減的私有髒頁數 */
+            int dead_dirty_count = atomic_read(&fi->dirty_pages);
+            
+            list_del_init(&fi->dirty_list);
+            atomic_set(&fi->dirty_pages, 0);
+            if (is_dir) {
+                clear_inode_flag(&fi->vfs_inode, FI_DIRTY_DIR);
+            }
+            
+            /* 同步扣減全域大帳本 (老闆的帳) */
+            while (dead_dirty_count > 0) {
+                dec_page_count(sbi, type_count);
+                dead_dirty_count--;
+            }
+        }
+        
+        spin_unlock(&sbi->inode_lock[type]);
+        /* ================================================== */
 	}
 	goto retry;
 }

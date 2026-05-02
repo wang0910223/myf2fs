@@ -607,6 +607,15 @@ int f2fs_issue_flush(struct f2fs_sb_info *sbi, nid_t ino)
 	struct flush_cmd cmd;
 	int ret;
 
+	/* ================================================== */
+	/* 🚨 CXL DAX MOD: 攔截並略過主裝置的 Flush 🚨        */
+	/* CXL 是持久化記憶體，不需要 Block Flush。直接回傳 0！*/
+	/* ================================================== */
+	if (sbi->is_cxl_dax) {
+		return 0;
+	}
+	/* ================================================== */
+
 	if (test_opt(sbi, NOBARRIER))
 		return 0;
 
@@ -2099,6 +2108,16 @@ static bool add_discard_addrs(struct f2fs_sb_info *sbi, struct cp_control *cpc,
 	int entries = SIT_VBLOCK_MAP_SIZE / sizeof(unsigned long);
 	int max_blocks = sbi->blocks_per_seg;
 	struct seg_entry *se = get_seg_entry(sbi, cpc->trim_start);
+
+	/* ============================================================== */
+    /* 🚨 CXL DAX 專屬防彈衣：如果這個區塊屬於 CXL 記憶體，直接跳過 TRIM 🚨 */
+    /* ============================================================== */
+    if (sbi->is_cxl_dax) {
+        int dev = f2fs_target_device_index(sbi, cpc->trim_start);
+        if (dev == 0)
+            return false;
+    }
+    /* ============================================================== */
 	unsigned long *cur_map = (unsigned long *)se->cur_valid_map;
 	unsigned long *ckpt_map = (unsigned long *)se->ckpt_valid_map;
 	unsigned long *discard_map = (unsigned long *)se->discard_map;

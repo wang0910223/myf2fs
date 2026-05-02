@@ -532,3 +532,20 @@ sudo mount -t myf2fs -o "cxl_phys=0x7880000000,cxl_size=34359738368" /dev/dax13.
 
 
 https://gemini.google.com/share/d0daf628c4ff
+
+
+# sync debug
+```
+# 1. 觀察進程狀態
+ps -eo pid,stat,pcpu,comm | grep -E "sync|f2fs"
+
+# 假設 PID 是 1234
+sudo cat /proc/1234/stack
+
+
+sudo perf top -p 8510
+
+sudo perf record -p 8510 -g -- sleep 3
+
+sudo perf record
+```

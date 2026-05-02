@@ -521,11 +521,22 @@ void f2fs_submit_read_bio(struct f2fs_sb_info *sbi, struct bio *bio,
 
 	/* --- CXL DAX NATIVE MOD:  intercept Device 0 --- */
     if (sbi->is_cxl_dax && bio->bi_bdev == NULL) {
+		printk(KERN_INFO "F2FS-CXL: Intercepting read bio for CXL DAX device\n");
         struct bio_vec bvl;
         struct bvec_iter iter;
+
+		// u64 dev0_size = (u64)(FDEV(0).end_blk - FDEV(0).start_blk + 1) << F2FS_BLKSIZE_BITS;
         
         // 正確使用 bvec_iter 來獲取每個 page 的真實 sector 偏移量
         bio_for_each_segment(bvl, bio, iter) {
+			// u64 offset = (u64)iter.bi_sector << 9;
+            
+            // if (offset + bvl.bv_len > dev0_size) {
+            //     printk(KERN_ERR "F2FS-CXL: Read out of bounds! offset=%llu\n", offset);
+            //     continue;
+            // }
+
+
             struct page *page = bvl.bv_page;
             void *cxl_addr = (char *)sbi->cxl_base_addr + (iter.bi_sector << 9); 
             void *kaddr = kmap_atomic(page);
@@ -580,10 +591,26 @@ static void f2fs_submit_write_bio(struct f2fs_sb_info *sbi, struct bio *bio,
 
 	/* --- CXL DAX NATIVE MOD:  intercept Device 0 --- */
     if (sbi->is_cxl_dax && bio->bi_bdev == NULL) {
-        struct bio_vec bvl;
+		/* ========================================================= */
+        /* 🚨 終極防線：攔截 Flush 空包裹！解決 122 秒卡死 🚨 */
+        /* ========================================================= */
+        if (bio_segments(bio) == 0) {
+            /* 如果想看它有沒有發揮作用，可以把下面這行取消註解 */
+            printk_ratelimited(KERN_INFO "F2FS-CXL: Intercepted empty FLUSH bio.\n");
+            bio->bi_status = BLK_STS_OK;
+            bio_endio(bio); /* 扭開 wait_for_completion 的鑰匙！ */
+            return;
+        }
+		/* 建議把原本的 printk 改成 ratelimited，避免高負載時狂洗 Log */
+        printk_ratelimited(KERN_INFO "F2FS-CXL: Intercepting write bio for CXL DAX device\n");
+
+
+		
+		struct bio_vec bvl;
         struct bvec_iter iter;
-        
+
         bio_for_each_segment(bvl, bio, iter) {
+			
             struct page *page = bvl.bv_page;
             void *cxl_addr = (char *)sbi->cxl_base_addr + (iter.bi_sector << 9);
             void *kaddr = kmap_atomic(page);
@@ -599,6 +626,11 @@ static void f2fs_submit_write_bio(struct f2fs_sb_info *sbi, struct bio *bio,
     /* --------------------------------------------- */
 
 	if (type == DATA || type == NODE) {
+
+		// 0425: CXL DAX sync
+		printk_ratelimited(KERN_WARNING "F2FS-DEBUG: Sending bio to ZNS! sector=%llu, size=%u\n", 
+                           (unsigned long long)bio->bi_iter.bi_sector, bio->bi_iter.bi_size);
+		//---------------------------------------------
 		if (f2fs_lfs_mode(sbi) && current->plug)
 			blk_finish_plug(current->plug);
 
@@ -781,6 +813,7 @@ int f2fs_submit_page_bio(struct f2fs_io_info *fio)
 	struct bio *bio;
 	struct page *page = fio->encrypted_page ?
 			fio->encrypted_page : fio->page;
+	bool is_in_cxl = false;
 
 	if (!f2fs_is_valid_blkaddr(fio->sbi, fio->new_blkaddr,
 			fio->is_por ? META_POR : (__is_meta_io(fio) ?
@@ -791,35 +824,40 @@ int f2fs_submit_page_bio(struct f2fs_io_info *fio)
 
 	trace_f2fs_submit_page_bio(page, fio);
 
-	// /* --- CXL DAX NATIVE MOD: 攔截並直接處理 Device 0 的 I/O --- */
-    // if (fio->sbi->is_cxl_dax && fio->dev_idx == 0) {
-    //     // 1. 計算在 CXL 內的絕對位址 (Block Address 轉 Byte Offset)
-    //     // 註：在你的 scan_devices 邏輯中，FDEV(0).start_blk 是 0
+	// /* --- CXL DAX NATIVE MOD: 終極短路攔截 (安全版) --- */
+    // if (fio->sbi->is_cxl_dax) {
+    //     /* 狀況 A：掛載極早期 (讀取 Superblock)，devs 還沒分配 */
+    //     if (!fio->sbi->devs) {
+    //         is_in_cxl = true;
+    //     } 
+    //     /* 狀況 B：掛載後期，裝置陣列已建立，精確判斷邊界 */
+    //     else if (fio->new_blkaddr <= fio->sbi->devs[0].end_blk) {
+    //         is_in_cxl = true;
+    //     }
+    // }
+
+    // if (is_in_cxl) {
+    //     // 1. 計算 CXL 記憶體絕對位址
     //     void *cxl_addr = (char *)fio->sbi->cxl_base_addr + 
     //                      ((u64)fio->new_blkaddr << F2FS_BLKSIZE_BITS);
         
-    //     // 2. 映射 Page 到核心虛擬空間
+    //     // 2. 映射 Page
     //     void *kaddr = kmap_atomic(page);
 
-    //     if (fio->op == REQ_OP_READ) {
-    //         // 讀取路徑：CXL -> Page
+    //     if (is_read_io(fio->op)) {
+    //         /* 讀取路徑 */
     //         memcpy(kaddr, cxl_addr, F2FS_BLKSIZE);
-    //         flush_dcache_page(page); // 確保 CPU Cache 與 Page 一致
-    //         SetPageUptodate(page);   // 標記這頁資料是新鮮的
+    //         flush_dcache_page(page);
+    //         SetPageUptodate(page);
+    //         unlock_page(page);
     //     } else {
-    //         // 寫入路徑：Page -> CXL (使用 flushcache 確保持久化)
+    //         /* 寫入路徑 */
     //         memcpy_flushcache(cxl_addr, kaddr, F2FS_BLKSIZE);
-	// 		end_page_writeback(page);
+    //         end_page_writeback(page);
     //     }
 
     //     kunmap_atomic(kaddr);
-
-    //     // 3. 模擬 BIO 完成後的行為
-    //     // F2FS 的讀寫等待者通常在等 page 被 unlock
-    //     unlock_page(page);
-        
-    //     // 這裡不需要增加 page count，因為我們沒經過 IO 統計路徑
-    //     return 0; 
+    //     return 0; // 攔截成功，直接返回！
     // }
     // /* --------------------------------------------------- */
 
@@ -840,6 +878,28 @@ int f2fs_submit_page_bio(struct f2fs_io_info *fio)
 
 	inc_page_count(fio->sbi, is_read_io(fio->op) ?
 			__read_io_type(page) : WB_DATA_TYPE(fio->page));
+
+	/* ==================================================================== */
+    /* 🚨 終極修復點：幫 Metadata 加上導航，讓它能正確取得 NULL 標籤！ 🚨 */
+    /* ==================================================================== */
+    if (f2fs_is_multi_device(fio->sbi)) {
+        struct block_device *bdev;
+        sector_t sector;
+        
+        /* 計算目標位址，如果是 CXL DAX，bdev 會拿到 NULL */
+        bdev = f2fs_target_device(fio->sbi, fio->new_blkaddr, &sector);
+
+		if (bdev) {
+            /* 如果是 ZNS，乖乖呼叫核心函式，綁定硬碟與 cgroup */
+            bio_set_dev(bio, bdev);
+        } else {
+            /* 🚨 CXL 專屬防彈衣：直接賦值 NULL，繞過 bio_set_dev 的 cgroup 死劫！ */
+            bio->bi_bdev = NULL;
+        }
+		
+        bio->bi_iter.bi_sector = sector;
+    }
+    /* ==================================================================== */
 
 	if (is_read_io(bio_op(bio)))
 		f2fs_submit_read_bio(fio->sbi, bio, fio->type);
