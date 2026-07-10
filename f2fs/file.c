@@ -4442,7 +4442,7 @@ free_buf:
 	f2fs_putname(buf);
 }
 
-static ssize_t f2fs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
+ssize_t f2fs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	const loff_t pos = iocb->ki_pos;
@@ -4748,7 +4748,7 @@ out:
 	return ret;
 }
 
-static ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	const loff_t orig_pos = iocb->ki_pos;

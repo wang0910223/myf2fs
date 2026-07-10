@@ -3533,6 +3533,8 @@ long f2fs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 long f2fs_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 int f2fs_transfer_project_quota(struct inode *inode, kprojid_t kprojid);
 int f2fs_pin_file_control(struct inode *inode, bool inc);
+ssize_t f2fs_file_read_iter(struct kiocb *iocb, struct iov_iter *to);
+ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from);
 
 /*
  * inode.c
