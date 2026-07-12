@@ -905,8 +905,9 @@ no_delete:
                         printk(KERN_ERR "myf2fs: Evicting DIRTY inode! ino=%lu\n", inode->i_ino);
 		f2fs_bug_on(sbi, is_inode_flag_set(inode, FI_DIRTY_INODE));
 	}
-	else
-		f2fs_inode_synced(inode);
+	
+	/* --- NATIVE MOD: ALWAYS remove from dirty list to prevent infinite loop in checkpoint --- */
+	f2fs_inode_synced(inode);
 
 	/* for the case f2fs_new_inode() was failed, .i_ino is zero, skip it */
 	if (inode->i_ino)

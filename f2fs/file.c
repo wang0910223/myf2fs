@@ -4778,7 +4778,20 @@ ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		inode_lock(inode);
 	}
 
+	/* 
+	 * Safely bypass generic_write_checks() returning -ETXTBSY for swapfiles.
+	 * f2fs_swap_rw() passes a magic value in iocb->private to signal that this is
+	 * a legitimate swap write. Since we hold the inode_lock, it's safe to
+	 * temporarily drop S_SWAPFILE.
+	 */
+	if (iocb->private == (void *)0xF2F55F2F)
+		inode->i_flags &= ~S_SWAPFILE;
+
 	ret = f2fs_write_checks(iocb, from);
+
+	if (iocb->private == (void *)0xF2F55F2F)
+		inode->i_flags |= S_SWAPFILE;
+
 	if (ret <= 0)
 		goto out_unlock;
 

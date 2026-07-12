@@ -187,6 +187,7 @@ enum {
 	Opt_age_extent_cache,
 	Opt_cxl_phys,  /* --- CXL DAX NATIVE MOD --- */
     Opt_cxl_size,  /* --- CXL NATIVE MOD --- */
+	Opt_swap_fs_ops, /* Force swap through fs ops for standard SSD */
 	Opt_errors,
 	Opt_err,
 };
@@ -272,6 +273,7 @@ static match_table_t f2fs_tokens = {
     {Opt_cxl_phys, "cxl_phys=%s"},
     {Opt_cxl_size, "cxl_size=%s"},
     /* ---------------------- */
+	{Opt_swap_fs_ops, "swap_fs_ops"},
 	{Opt_err, NULL},
 };
 
@@ -1345,6 +1347,9 @@ static int parse_options(struct super_block *sb, char *options, bool is_remount)
 		case Opt_age_extent_cache:
 			set_opt(sbi, AGE_EXTENT_CACHE);
 			break;
+		case Opt_swap_fs_ops:
+			set_opt(sbi, SWAP_FS_OPS);
+			break;
 		case Opt_errors:
 			name = match_strdup(&args[0]);
 			if (!name)
@@ -2047,6 +2052,8 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
 
 	if (test_opt(sbi, DISABLE_ROLL_FORWARD))
 		seq_puts(seq, ",disable_roll_forward");
+	if (test_opt(sbi, SWAP_FS_OPS))
+		seq_puts(seq, ",swap_fs_ops");
 	if (test_opt(sbi, NORECOVERY))
 		seq_puts(seq, ",norecovery");
 	if (test_opt(sbi, DISCARD)) {

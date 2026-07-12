@@ -4028,6 +4028,8 @@ static int f2fs_swap_activate(struct swap_info_struct *sis, struct file *file,
   struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
   int ret;
 
+  bool use_fs_ops = false;
+
   if (!S_ISREG(inode->i_mode))
     return -EINVAL;
 
@@ -4035,17 +4037,16 @@ static int f2fs_swap_activate(struct swap_info_struct *sis, struct file *file,
     return -EROFS;
 
   /*
-   * ZNS devices require sequential writes only.  Traditional swap
-   * uses direct BIO with random overwrites, which violates ZNS
-   * constraints.  When the filesystem is mounted on a zoned block
-   * device (blkzoned feature) and operates in LFS mode, we instead
-   * set SWP_FS_OPS so that all swap I/O is routed back through
-   * f2fs_swap_rw(), allowing F2FS's log-structured write path to
-   * convert random swap writes into sequential, ZNS-compatible
-   * writes via out-of-place updates.
+   * For ZNS devices, swap I/O must be sequential.
+   * We can also forcefully enable this for standard SSDs via swap_fs_ops option.
    */
-  if (f2fs_sb_has_blkzoned(sbi) && f2fs_lfs_mode(sbi)) {
-    f2fs_info(sbi, "ZNS swapfile: enabling SWP_FS_OPS to route I/O via f2fs");
+  if (f2fs_sb_has_blkzoned(sbi) && f2fs_lfs_mode(sbi))
+    use_fs_ops = true;
+  if (test_opt(sbi, SWAP_FS_OPS))
+    use_fs_ops = true;
+
+  if (use_fs_ops) {
+    f2fs_info(sbi, "Swapfile: enabling SWP_FS_OPS to route I/O via f2fs");
     ret = f2fs_convert_inline_inode(inode);
     if (ret)
       return ret;
@@ -4053,17 +4054,7 @@ static int f2fs_swap_activate(struct swap_info_struct *sis, struct file *file,
     if (!f2fs_disable_compressed_file(inode))
       return -EINVAL;
 
-    /*
-     * We intentionally skip check_swap_activate() and FI_PIN_FILE
-     * because in ZNS/LFS mode blocks are never overwritten in-place;
-     * F2FS performs out-of-place updates, so a fixed block-map is
-     * both unnecessary and incorrect.  The swap subsystem will use
-     * SWP_FS_OPS to call swap_rw for every page I/O instead.
-     */
     sis->flags |= SWP_FS_OPS;
-    /* Tell the swap subsystem how many swap pages are available.
-     * We derive this from the file size, excluding the header page.
-     */
     sis->max = bytes_to_blks(inode, i_size_read(inode));
     sis->pages = sis->max - 1;
     sis->highest_bit = sis->max - 1;
@@ -4074,7 +4065,7 @@ static int f2fs_swap_activate(struct swap_info_struct *sis, struct file *file,
   }
 
   if (f2fs_lfs_mode(sbi)) {
-    f2fs_err(sbi, "Swapfile not supported in LFS mode (non-ZNS)");
+    f2fs_err(sbi, "Swapfile not supported in LFS mode without SWP_FS_OPS");
     return -EINVAL;
   }
 
@@ -4100,14 +4091,16 @@ static int f2fs_swap_activate(struct swap_info_struct *sis, struct file *file,
 static void f2fs_swap_deactivate(struct file *file) {
   struct inode *inode = file_inode(file);
   struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+  bool use_fs_ops = false;
+
+  if (f2fs_sb_has_blkzoned(sbi) && f2fs_lfs_mode(sbi))
+    use_fs_ops = true;
+  if (test_opt(sbi, SWAP_FS_OPS))
+    use_fs_ops = true;
 
   stat_dec_swapfile_inode(inode);
-  /*
-   * In ZNS/LFS mode we never set FI_PIN_FILE (because blocks are
-   * managed out-of-place), so only clear it for the conventional
-   * (non-ZNS) swap path.
-   */
-  if (!(f2fs_sb_has_blkzoned(sbi) && f2fs_lfs_mode(sbi)))
+  
+  if (!use_fs_ops)
     clear_inode_flag(inode, FI_PIN_FILE);
 }
 
@@ -4135,24 +4128,24 @@ static int f2fs_swap_rw(struct kiocb *iocb, struct iov_iter *iter) {
 
   if (iov_iter_rw(iter) == WRITE) {
     /*
-     * Hack to bypass generic_write_checks().
-     * generic_write_checks() returns -ETXTBSY if IS_SWAPFILE(inode) is true
-     * to prevent userspace from writing to active swap files. Since this
-     * write request originates from the swap subsystem itself via SWP_FS_OPS,
-     * it is legitimate. We temporarily clear S_SWAPFILE to let it pass.
+     * To bypass generic_write_checks() returning -ETXTBSY for active swap files,
+     * we pass a magic value in iocb->private to signal f2fs_file_write_iter()
+     * that this is a legitimate swap write. f2fs_file_write_iter() will safely
+     * toggle S_SWAPFILE under the inode lock.
      */
-    inode->i_flags &= ~S_SWAPFILE;
+    void *old_private = iocb->private;
+    iocb->private = (void *)0xF2F55F2F;
     iocb->ki_flags |= IOCB_DIRECT | IOCB_DSYNC;
     ret = f2fs_file_write_iter(iocb, iter);
-    inode->i_flags |= S_SWAPFILE;
+    iocb->private = old_private;
   } else {
     iocb->ki_flags |= IOCB_DIRECT | IOCB_DSYNC;
     ret = f2fs_file_read_iter(iocb, iter);
   }
 
-  printk_ratelimited(KERN_INFO
-                     "F2FS-SWAP: f2fs_swap_rw %s pos=%lld len=%zu ret=%d\n",
-                     dir_str, pos, len, ret);
+  // printk_ratelimited(KERN_INFO
+  //                    "F2FS-SWAP: f2fs_swap_rw %s pos=%lld len=%zu ret=%d\n",
+  //                    dir_str, pos, len, ret);
 
   return ret;
 }

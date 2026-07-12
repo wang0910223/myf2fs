@@ -1299,6 +1299,7 @@ static int block_operations(struct f2fs_sb_info *sbi)
 		.for_reclaim = 0,
 	};
 	int err = 0, cnt = 0;
+	int imeta_retry = 0;
 
 	/*
 	 * Let's flush inline_data in dirty node pages.
@@ -1344,6 +1345,14 @@ retry_flush_dents:
 	f2fs_down_write(&sbi->node_change);
 
 	if (get_pages(sbi, F2FS_DIRTY_IMETA)) {
+		if (++imeta_retry > DEFAULT_RETRY_QUOTA_FLUSH_COUNT) {
+			/* Force-clean remaining dirty imeta to break the loop */
+			f2fs_sync_inode_meta(sbi);
+			f2fs_up_write(&sbi->node_change);
+			f2fs_unlock_all(sbi);
+			f2fs_warn(sbi, "Too many DIRTY_IMETA retries, skip remaining");
+			goto retry_flush_dents;
+		}
 		f2fs_up_write(&sbi->node_change);
 		f2fs_unlock_all(sbi);
 		err = f2fs_sync_inode_meta(sbi);

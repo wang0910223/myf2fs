@@ -1306,6 +1306,7 @@ static int __submit_discard_cmd(struct f2fs_sb_info *sbi,
         /* 1. 標記為完成 (D_DONE)，這樣 wait_for_completion 就會直接略過等待 */
         spin_lock_irqsave(&dc->lock, flags);
         dc->state = D_DONE;
+        complete_all(&dc->wait);
         spin_unlock_irqrestore(&dc->lock, flags);
 
         /* 2. 維持正確的計數，防止 umount 時卡死 */
