@@ -3896,7 +3896,26 @@ static int f2fs_migrate_blocks(struct inode *inode, block_t start_blk,
 
     clear_inode_flag(inode, FI_SKIP_WRITES);
 
-    ret = filemap_fdatawrite(inode->i_mapping);
+    /*
+     * Must use WB_SYNC_ALL, NOT filemap_fdatawrite (WB_SYNC_NONE).
+     *
+     * With WB_SYNC_NONE: if a concurrent checkpoint holds cp_rwsem,
+     * f2fs_do_write_data_page returns -EAGAIN (can't get cp_rwsem via
+     * f2fs_trylock_op), and f2fs_write_cache_pages does 'goto next'
+     * which SKIPS the page. The dnode remains at NEW_ADDR, and
+     * check_swap_activate loops forever.
+     *
+     * With WB_SYNC_ALL: -EAGAIN causes f2fs_io_schedule_timeout +
+     * goto retry_write, so the write eventually succeeds once the
+     * checkpoint releases cp_rwsem.
+     */
+    {
+      struct writeback_control wbc = {
+        .sync_mode = WB_SYNC_ALL,
+        .nr_to_write = LONG_MAX,
+      };
+      ret = do_writepages(inode->i_mapping, &wbc);
+    }
 
     f2fs_up_write(&sbi->pin_sem);
 
@@ -3911,6 +3930,11 @@ done:
 
   filemap_invalidate_unlock(inode->i_mapping);
   f2fs_up_write(&F2FS_I(inode)->i_gc_rwsem[WRITE]);
+
+  /* Drop the read extent cache so that the next f2fs_map_blocks
+   * call in check_swap_activate reads fresh physical block addresses
+   * from the node tree, not stale cached (unaligned) ones. */
+  f2fs_drop_extent_tree(inode);
 
   return ret;
 }
@@ -3931,6 +3955,7 @@ static int check_swap_activate(struct swap_info_struct *sis,
   unsigned int sec_blks_mask = BLKS_PER_SEC(sbi) - 1;
   unsigned int not_aligned = 0;
   int ret = 0;
+  int max_retry = 10; /* Avoid infinite loop if migrate keeps failing */
 
   /*
    * Map all the blocks into the extent list.  This code doesn't try
@@ -3969,6 +3994,17 @@ static int check_swap_activate(struct swap_info_struct *sis,
     if ((pblock - SM_I(sbi)->main_blkaddr) & sec_blks_mask ||
         nr_pblocks & sec_blks_mask) {
       not_aligned++;
+
+      f2fs_warn(sbi, "Swapfile: lblk=%llu pblk=%llu nr=%lu not aligned (main=%u mask=%u retry=%d)",
+                (unsigned long long)cur_lblock, (unsigned long long)pblock,
+                nr_pblocks, SM_I(sbi)->main_blkaddr, sec_blks_mask,
+                not_aligned);
+
+      if (max_retry-- <= 0) {
+        f2fs_err(sbi, "Swapfile: too many retries aligning blocks, aborting");
+        ret = -EINVAL;
+        goto out;
+      }
 
       nr_pblocks = roundup(nr_pblocks, blks_per_sec);
       if (cur_lblock + nr_pblocks > sis->max)

@@ -804,6 +804,7 @@ void f2fs_evict_inode(struct inode *inode)
 	struct f2fs_inode_info *fi = F2FS_I(inode);
 	nid_t xnid = fi->i_xattr_nid;
 	int err = 0;
+	int retry_count = 0;
 
 	f2fs_abort_atomic_write(inode, true);
 
@@ -879,7 +880,10 @@ retry:
 	/* give more chances, if ENOMEM case */
 	if (err == -ENOMEM) {
 		err = 0;
-		goto retry;
+		if (++retry_count <= 10) {
+			goto retry;
+		}
+		f2fs_warn(sbi, "f2fs_evict_inode: retry limit exceeded for ENOMEM, bypassing");
 	}
 
 	if (err) {
