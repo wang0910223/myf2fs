@@ -1864,8 +1864,12 @@ next_block:
 		map->m_pblk = blkaddr;
 		map->m_len = 1;
 
-		if (map->m_multidev_dio)
+		if (map->m_multidev_dio) {
 			map->m_bdev = FDEV(bidx).bdev;
+			f2fs_info(sbi,
+				"map_blocks[first]: inode=%lu blkaddr=%llu bidx=%d bdev=%ps",
+				inode->i_ino, (u64)blkaddr, bidx, FDEV(bidx).bdev);
+		}
 	} else if ((map->m_pblk != NEW_ADDR &&
 			blkaddr == (map->m_pblk + ofs)) ||
 			(map->m_pblk == NEW_ADDR && blkaddr == NEW_ADDR) ||
@@ -1938,6 +1942,9 @@ sync_out:
 			bidx = f2fs_target_device_index(sbi, map->m_pblk);
 
 			map->m_bdev = FDEV(bidx).bdev;
+			f2fs_info(sbi,
+				"map_blocks[sync_out]: inode=%lu pblk=%llu bidx=%d bdev=%ps",
+				inode->i_ino, (u64)map->m_pblk, bidx, FDEV(bidx).bdev);
 			map->m_pblk -= FDEV(bidx).start_blk;
 
 			if (map->m_may_create)
@@ -4319,25 +4326,77 @@ static void f2fs_swap_deactivate(struct file *file)
 static int f2fs_swap_rw(struct kiocb *iocb, struct iov_iter *iter)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+	const char *rw_str = (iov_iter_rw(iter) == WRITE) ? "WRITE" : "READ";
+	loff_t pos = iocb->ki_pos;
+	size_t count = iov_iter_count(iter);
 	int ret;
 
+	f2fs_info(sbi,
+		"swap_rw: %s inode=%lu pos=%lld count=%zu ki_flags=0x%x",
+		rw_str, inode->i_ino, pos, count, iocb->ki_flags);
+
+	/* Sanity checks before diving in */
+	if (unlikely(!inode->i_mapping)) {
+		f2fs_err(sbi, "swap_rw: %s inode=%lu has NULL i_mapping!",
+			 rw_str, inode->i_ino);
+		return -EIO;
+	}
+	if (unlikely(!inode->i_mapping->a_ops)) {
+		f2fs_err(sbi, "swap_rw: %s inode=%lu has NULL a_ops!",
+			 rw_str, inode->i_ino);
+		return -EIO;
+	}
+	if (unlikely(!iocb->ki_filp)) {
+		f2fs_err(sbi, "swap_rw: %s inode=%lu has NULL ki_filp!",
+			 rw_str, inode->i_ino);
+		return -EIO;
+	}
+
 	if (iov_iter_rw(iter) == WRITE) {
+		// iocb->ki_flags |= IOCB_DIRECT | IOCB_DSYNC;
 		/*
-		 * Hack to bypass generic_write_checks().
-		 * generic_write_checks() returns -ETXTBSY if IS_SWAPFILE(inode) is true
-		 * to prevent userspace from writing to active swap files. Since this
-		 * write request originates from the swap subsystem itself via SWP_FS_OPS,
-		 * it is legitimate. We temporarily clear S_SWAPFILE to let it pass.
+		 * Use buffered write (no IOCB_DIRECT) so that f2fs's normal
+		 * page-cache writeback path handles device dispatch.  This
+		 * avoids iomap_dio_bio_iter which requires bdev->bd_queue —
+		 * a pointer that CXL DAX devices (FDEV(0)) do not provide.
+		 * IOCB_DSYNC ensures data is flushed to storage before we
+		 * return, preserving swap correctness.
 		 */
-		inode->i_flags &= ~S_SWAPFILE;
-		iocb->ki_flags |= IOCB_DIRECT | IOCB_DSYNC;
+		iocb->ki_flags |= IOCB_DSYNC;
+		f2fs_info(sbi,
+			"swap_rw: WRITE(buffered+dsync) -> f2fs_file_write_iter "
+			"inode=%lu pos=%lld count=%zu",
+			inode->i_ino, iocb->ki_pos, count);
+
 		ret = f2fs_file_write_iter(iocb, iter);
-		inode->i_flags |= S_SWAPFILE;
+
+		if (ret < 0)
+			f2fs_err(sbi,
+				"swap_rw: WRITE FAILED inode=%lu pos_in=%lld count=%zu ret=%d",
+				inode->i_ino, pos, count, ret);
+		else
+			f2fs_info(sbi,
+				"swap_rw: WRITE OK inode=%lu pos_in=%lld bytes=%d new_pos=%lld",
+				inode->i_ino, pos, ret, iocb->ki_pos);
 	} else {
 		iocb->ki_flags |= IOCB_DIRECT | IOCB_DSYNC;
+		f2fs_info(sbi,
+			"swap_rw: READ -> f2fs_file_read_iter inode=%lu pos=%lld count=%zu",
+			inode->i_ino, iocb->ki_pos, count);
+
 		ret = f2fs_file_read_iter(iocb, iter);
+
+		if (ret < 0)
+			f2fs_err(sbi,
+				"swap_rw: READ FAILED inode=%lu pos_in=%lld count=%zu ret=%d",
+				inode->i_ino, pos, count, ret);
+		else
+			f2fs_info(sbi,
+				"swap_rw: READ OK inode=%lu pos_in=%lld bytes=%d new_pos=%lld",
+				inode->i_ino, pos, ret, iocb->ki_pos);
 	}
-	
+
 	return ret;
 }
 #else
@@ -4441,6 +4500,7 @@ static int f2fs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 			    unsigned int flags, struct iomap *iomap,
 			    struct iomap *srcmap)
 {
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct f2fs_map_blocks map = {};
 	pgoff_t next_pgofs = 0;
 	int err;
@@ -4480,9 +4540,39 @@ static int f2fs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 		iomap->flags |= IOMAP_F_MERGED;
 		iomap->bdev = map.m_bdev;
 		iomap->addr = blks_to_bytes(inode, map.m_pblk);
+
+		/* Flag CXL device for f2fs_dio_submit_io */
+		if (!map.m_bdev && sbi->is_cxl_dax)
+			iomap->private = (void *)1;
+		else
+			iomap->private = NULL;
+
+		/* Debug: show which device this I/O is targeting */
+		if (iomap->bdev) {
+			f2fs_info(sbi,
+				"iomap_begin: inode=%lu lblk=%u pblk=%llu len=%u "
+				"dev=%s multidev=%d flags=0x%x",
+				inode->i_ino, map.m_lblk, (u64)map.m_pblk,
+				map.m_len,
+				iomap->bdev->bd_disk->disk_name,
+				map.m_multidev_dio, flags);
+		} else {
+			f2fs_err(sbi,
+				"iomap_begin: inode=%lu lblk=%u pblk=%llu "
+				"bdev=NULL! multidev=%d flags=0x%x  <-- likely crash cause",
+				inode->i_ino, map.m_lblk, (u64)map.m_pblk,
+				map.m_multidev_dio, flags);
+			/* Fallback to superblock bdev to prevent crash */
+			iomap->bdev = inode->i_sb->s_bdev;
+		}
 	} else {
-		if (flags & IOMAP_WRITE)
+		if (flags & IOMAP_WRITE) {
+			f2fs_err(sbi,
+				"iomap_begin: inode=%lu lblk=%u HOLE on WRITE path! "
+				"(pblk=NULL_ADDR) flags=0x%x",
+				inode->i_ino, map.m_lblk, flags);
 			return -ENOTBLK;
+		}
 		iomap->length = blks_to_bytes(inode, next_pgofs) -
 				iomap->offset;
 		iomap->type = IOMAP_HOLE;

@@ -816,7 +816,7 @@ static bool f2fs_force_buffered_io(struct inode *inode, int rw)
 	 * for blkzoned device, fallback direct IO to buffered IO, so
 	 * all IOs can be serialized by log-structured write.
 	 */
-	if (f2fs_sb_has_blkzoned(sbi) && (rw == WRITE))
+	if (f2fs_sb_has_blkzoned(sbi) && (rw == WRITE) && !IS_SWAPFILE(inode))
 		return true;
 	if (f2fs_lfs_mode(sbi) && rw == WRITE && F2FS_IO_ALIGNED(sbi))
 		return true;
@@ -4498,6 +4498,7 @@ static ssize_t f2fs_write_checks(struct kiocb *iocb, struct iov_iter *from)
 	struct inode *inode = file_inode(file);
 	ssize_t count;
 	int err;
+	bool is_swap = IS_SWAPFILE(inode);
 
 	if (IS_IMMUTABLE(inode))
 		return -EPERM;
@@ -4505,7 +4506,14 @@ static ssize_t f2fs_write_checks(struct kiocb *iocb, struct iov_iter *from)
 	if (is_inode_flag_set(inode, FI_COMPRESS_RELEASED))
 		return -EPERM;
 
+	if (unlikely(is_swap))
+		inode->i_flags &= ~S_SWAPFILE;
+
 	count = generic_write_checks(iocb, from);
+
+	if (unlikely(is_swap))
+		inode->i_flags |= S_SWAPFILE;
+
 	if (count <= 0)
 		return count;
 
@@ -4779,6 +4787,8 @@ ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	}
 
 	ret = f2fs_write_checks(iocb, from);
+	if (ret < 0)
+		printk(KERN_ERR "F2FS-CXL: f2fs_write_checks returned %zd\n", ret);
 	if (ret <= 0)
 		goto out_unlock;
 
