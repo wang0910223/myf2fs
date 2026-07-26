@@ -2736,7 +2736,7 @@ static int is_next_segment_free(struct f2fs_sb_info *sbi,
  * This function should be returned with success, otherwise BUG
  */
 static void get_new_segment(struct f2fs_sb_info *sbi,
-			unsigned int *newseg, bool new_sec, int dir)
+			unsigned int *newseg, bool new_sec, int dir, int type)
 {
 	struct free_segmap_info *free_i = FREE_I(sbi);
 	unsigned int segno, secno, zoneno;
@@ -2747,6 +2747,20 @@ static void get_new_segment(struct f2fs_sb_info *sbi,
 	bool init = true;
 	int go_left = 0;
 	int i;
+	unsigned int zns_start_sec = 0;
+
+	if (sbi->s_ndevs > 1 && type == CURSEG_COLD_DATA) {
+		zns_start_sec = ((FDEV(1).start_blk - MAIN_BLKADDR(sbi)) >>
+					sbi->log_blocks_per_seg) / sbi->segs_per_sec;
+		if (hint < zns_start_sec) {
+			f2fs_info(sbi,
+				"[ZNS-ALLOCATOR] Redirecting COLD_DATA (swap) allocation: section %u -> %u (ZNS Device 1)",
+				hint, zns_start_sec);
+			hint = zns_start_sec;
+			new_sec = true;
+			*newseg = GET_SEG_FROM_SEC(sbi, zns_start_sec);
+		}
+	}
 
 	spin_lock(&free_i->segmap_lock);
 
@@ -2760,8 +2774,8 @@ find_other_zone:
 	secno = find_next_zero_bit(free_i->free_secmap, MAIN_SECS(sbi), hint);
 	if (secno >= MAIN_SECS(sbi)) {
 		if (dir == ALLOC_RIGHT) {
-			secno = find_first_zero_bit(free_i->free_secmap,
-							MAIN_SECS(sbi));
+			secno = find_next_zero_bit(free_i->free_secmap,
+							MAIN_SECS(sbi), zns_start_sec);
 			f2fs_bug_on(sbi, secno >= MAIN_SECS(sbi));
 		} else {
 			go_left = 1;
@@ -2808,7 +2822,7 @@ skip_left:
 		if (go_left)
 			hint = zoneno * sbi->secs_per_zone - 1;
 		else if (zoneno + 1 >= total_zones)
-			hint = 0;
+			hint = zns_start_sec;
 		else
 			hint = (zoneno + 1) * sbi->secs_per_zone;
 		init = false;
@@ -2901,7 +2915,7 @@ static void new_curseg(struct f2fs_sb_info *sbi, int type, bool new_sec)
 		dir = ALLOC_RIGHT;
 
 	segno = __get_next_segno(sbi, type);
-	get_new_segment(sbi, &segno, new_sec, dir);
+	get_new_segment(sbi, &segno, new_sec, dir, type);
 	curseg->next_segno = segno;
 	reset_curseg(sbi, type, 1);
 	curseg->alloc_type = LFS;
@@ -3531,6 +3545,21 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 		sanity_check_seg_type(sbi, se->type);
 		f2fs_bug_on(sbi, IS_NODESEG(se->type));
 	}
+
+	/* CXL DAX MOD: Force initial COLD_DATA (swap) segment to ZNS */
+	if (sbi->s_ndevs > 1 && type == CURSEG_COLD_DATA && !from_gc) {
+		unsigned int zns_start_seg = ((FDEV(1).start_blk - MAIN_BLKADDR(sbi)) >>
+					sbi->log_blocks_per_seg);
+		if (curseg->segno < zns_start_seg) {
+			f2fs_info(sbi, "[ZNS-ALLOCATOR] Forcing new_curseg for initial COLD_DATA to ZNS device");
+			if (need_new_seg(sbi, type))
+				new_curseg(sbi, type, true);
+			else
+				change_curseg(sbi, type);
+			stat_inc_seg_type(sbi, curseg);
+		}
+	}
+
 	*new_blkaddr = NEXT_FREE_BLKADDR(sbi, curseg);
 
 	f2fs_bug_on(sbi, curseg->next_blkoff >= sbi->blocks_per_seg);

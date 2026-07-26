@@ -1749,6 +1749,9 @@ int f2fs_map_blocks(struct inode *inode, struct f2fs_map_blocks *map, int flag)
 	map->m_multidev_dio =
 		f2fs_allow_multi_device_dio(F2FS_I_SB(inode), flag);
 
+	if (inode->i_write_hint == WRITE_LIFE_EXTREME || IS_SWAPFILE(inode))
+		map->m_seg_type = CURSEG_COLD_DATA;
+
 	map->m_len = 0;
 	map->m_flags = 0;
 
@@ -4354,18 +4357,9 @@ static int f2fs_swap_rw(struct kiocb *iocb, struct iov_iter *iter)
 	}
 
 	if (iov_iter_rw(iter) == WRITE) {
-		// iocb->ki_flags |= IOCB_DIRECT | IOCB_DSYNC;
-		/*
-		 * Use buffered write (no IOCB_DIRECT) so that f2fs's normal
-		 * page-cache writeback path handles device dispatch.  This
-		 * avoids iomap_dio_bio_iter which requires bdev->bd_queue —
-		 * a pointer that CXL DAX devices (FDEV(0)) do not provide.
-		 * IOCB_DSYNC ensures data is flushed to storage before we
-		 * return, preserving swap correctness.
-		 */
-		iocb->ki_flags |= IOCB_DSYNC;
+		iocb->ki_flags |= IOCB_DIRECT | IOCB_DSYNC;
 		f2fs_info(sbi,
-			"swap_rw: WRITE(buffered+dsync) -> f2fs_file_write_iter "
+			"swap_rw: WRITE(direct+dsync) -> f2fs_file_write_iter "
 			"inode=%lu pos=%lld count=%zu",
 			inode->i_ino, iocb->ki_pos, count);
 

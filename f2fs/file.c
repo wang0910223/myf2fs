@@ -556,6 +556,16 @@ static int f2fs_file_open(struct inode *inode, struct file *filp)
 	filp->f_mode |= FMODE_NOWAIT | FMODE_BUF_RASYNC;
 	filp->f_mode |= FMODE_CAN_ODIRECT;
 
+	if (filp->f_path.dentry && filp->f_path.dentry->d_name.name) {
+		if (strstr(filp->f_path.dentry->d_name.name, "swap") ||
+		    strstr(filp->f_path.dentry->d_name.name, "SWAP")) {
+			inode->i_write_hint = WRITE_LIFE_EXTREME;
+			f2fs_info(F2FS_I_SB(inode),
+				"[ZNS-SWAP-DETECTOR] Auto-detected swapfile '%s' (ino=%lu)! Set WRITE_LIFE_EXTREME -> COLD_DATA",
+				filp->f_path.dentry->d_name.name, inode->i_ino);
+		}
+	}
+
 	return dquot_file_open(inode, filp);
 }
 
