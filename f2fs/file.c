@@ -4706,6 +4706,10 @@ static ssize_t f2fs_dio_write_iter(struct kiocb *iocb, struct iov_iter *from,
 	dio_flags = 0;
 	if (pos + count > inode->i_size)
 		dio_flags |= IOMAP_DIO_FORCE_WAIT;
+
+	/* Force synchronous DIO for swapfile on zoned devices to prevent out-of-order writes */
+	if (f2fs_sb_has_blkzoned(sbi) && IS_SWAPFILE(inode))
+		dio_flags |= IOMAP_DIO_FORCE_WAIT;
 	dio = __iomap_dio_rw(iocb, from, &f2fs_iomap_ops,
 			     &f2fs_iomap_dio_write_ops, dio_flags, NULL, 0);
 	if (IS_ERR_OR_NULL(dio)) {
@@ -4822,6 +4826,13 @@ ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 		if (trace_f2fs_datawrite_end_enabled())
 			trace_f2fs_datawrite_end(inode, orig_pos, ret);
+
+		/* 
+		 * Serialize async DIO swap writes on ZNS by flushing the plug 
+		 * before dropping inode_lock.
+		 */
+		if (f2fs_sb_has_blkzoned(F2FS_I_SB(inode)) && IS_SWAPFILE(inode) && current->plug)
+			blk_finish_plug(current->plug);
 	}
 
 	/* Don't leave any preallocated blocks around past i_size. */

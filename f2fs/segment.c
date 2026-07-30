@@ -2957,11 +2957,14 @@ bool f2fs_segment_has_free_slot(struct f2fs_sb_info *sbi, int segno)
  */
 static void change_curseg(struct f2fs_sb_info *sbi, int type)
 {
+	
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
 	struct curseg_info *curseg = CURSEG_I(sbi, type);
 	unsigned int new_segno = curseg->next_segno;
 	struct f2fs_summary_block *sum_node;
 	struct page *sum_page;
+
+	f2fs_err(sbi, "[ZNS-CHECK] change_curseg called! type=%d segno=%u", type, curseg->segno);
 
 	write_sum_page(sbi, curseg->sum_blk, GET_SUM_BLOCK(sbi, curseg->segno));
 
@@ -3521,7 +3524,9 @@ static void f2fs_randomize_chunk(struct f2fs_sb_info *sbi,
 	seg->next_blkoff +=
 		get_random_u32_inclusive(1, sbi->max_fragment_hole);
 }
-
+static inline bool f2fs_zns_swap_seg(struct f2fs_sb_info *sbi, int type){
+	return f2fs_sb_has_blkzoned(sbi) && f2fs_lfs_mode(sbi);
+}
 void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 		block_t old_blkaddr, block_t *new_blkaddr,
 		struct f2fs_summary *sum, int type,
@@ -3552,7 +3557,11 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 					sbi->log_blocks_per_seg);
 		if (curseg->segno < zns_start_seg) {
 			f2fs_info(sbi, "[ZNS-ALLOCATOR] Forcing new_curseg for initial COLD_DATA to ZNS device");
-			if (need_new_seg(sbi, type))
+			printk_ratelimited("[ZNS-ALLOCATOR] Forcing new_curseg for initial COLD_DATA to ZNS device");
+			if(f2fs_zns_swap_seg(sbi, type)){
+				new_curseg(sbi, type, true);
+			}
+			else if (need_new_seg(sbi, type))
 				new_curseg(sbi, type, true);
 			else
 				change_curseg(sbi, type);
@@ -3561,6 +3570,8 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 	}
 
 	*new_blkaddr = NEXT_FREE_BLKADDR(sbi, curseg);
+	if(f2fs_zns_swap_seg(sbi, type) && curseg->alloc_type == SSR)
+		f2fs_err(sbi, "[ZNS-BUG] SSR on ZNS! segno=%u next_blkoff=%u", curseg->segno, curseg->next_blkoff);
 
 	f2fs_bug_on(sbi, curseg->next_blkoff >= sbi->blocks_per_seg);
 
@@ -3603,7 +3614,10 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 			get_atssr_segment(sbi, type, se->type,
 						AT_SSR, se->mtime);
 		} else {
-			if (need_new_seg(sbi, type))
+			if(f2fs_zns_swap_seg(sbi, type)){
+				new_curseg(sbi, type, false);
+			}
+			else if (need_new_seg(sbi, type))
 				new_curseg(sbi, type, false);
 			else
 				change_curseg(sbi, type);

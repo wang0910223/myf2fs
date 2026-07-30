@@ -521,7 +521,7 @@ void f2fs_submit_read_bio(struct f2fs_sb_info *sbi, struct bio *bio,
 
 	/* --- CXL DAX NATIVE MOD:  intercept Device 0 --- */
     if (sbi->is_cxl_dax && bio->bi_bdev == NULL) {
-		printk(KERN_INFO "F2FS-CXL: Intercepting read bio for CXL DAX device\n");
+		// printk(KERN_INFO "F2FS-CXL: Intercepting read bio for CXL DAX device\n");
         struct bio_vec bvl;
         struct bvec_iter iter;
 
@@ -1869,9 +1869,11 @@ next_block:
 
 		if (map->m_multidev_dio) {
 			map->m_bdev = FDEV(bidx).bdev;
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 			f2fs_info(sbi,
 				"map_blocks[first]: inode=%lu blkaddr=%llu bidx=%d bdev=%ps",
 				inode->i_ino, (u64)blkaddr, bidx, FDEV(bidx).bdev);
+#endif
 		}
 	} else if ((map->m_pblk != NEW_ADDR &&
 			blkaddr == (map->m_pblk + ofs)) ||
@@ -1945,9 +1947,11 @@ sync_out:
 			bidx = f2fs_target_device_index(sbi, map->m_pblk);
 
 			map->m_bdev = FDEV(bidx).bdev;
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 			f2fs_info(sbi,
 				"map_blocks[sync_out]: inode=%lu pblk=%llu bidx=%d bdev=%ps",
 				inode->i_ino, (u64)map->m_pblk, bidx, FDEV(bidx).bdev);
+#endif
 			map->m_pblk -= FDEV(bidx).start_blk;
 
 			if (map->m_may_create)
@@ -4335,9 +4339,11 @@ static int f2fs_swap_rw(struct kiocb *iocb, struct iov_iter *iter)
 	size_t count = iov_iter_count(iter);
 	int ret;
 
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 	f2fs_info(sbi,
 		"swap_rw: %s inode=%lu pos=%lld count=%zu ki_flags=0x%x",
 		rw_str, inode->i_ino, pos, count, iocb->ki_flags);
+#endif
 
 	/* Sanity checks before diving in */
 	if (unlikely(!inode->i_mapping)) {
@@ -4358,37 +4364,49 @@ static int f2fs_swap_rw(struct kiocb *iocb, struct iov_iter *iter)
 
 	if (iov_iter_rw(iter) == WRITE) {
 		iocb->ki_flags |= IOCB_DIRECT | IOCB_DSYNC;
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 		f2fs_info(sbi,
 			"swap_rw: WRITE(direct+dsync) -> f2fs_file_write_iter "
 			"inode=%lu pos=%lld count=%zu",
 			inode->i_ino, iocb->ki_pos, count);
+#endif
 
 		ret = f2fs_file_write_iter(iocb, iter);
 
-		if (ret < 0)
+		if (ret < 0 && ret != -EIOCBQUEUED) {
 			f2fs_err(sbi,
 				"swap_rw: WRITE FAILED inode=%lu pos_in=%lld count=%zu ret=%d",
 				inode->i_ino, pos, count, ret);
-		else
+		} else {
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 			f2fs_info(sbi,
-				"swap_rw: WRITE OK inode=%lu pos_in=%lld bytes=%d new_pos=%lld",
+				"swap_rw: WRITE %s inode=%lu pos_in=%lld bytes=%d new_pos=%lld",
+				(ret == -EIOCBQUEUED) ? "QUEUED" : "OK",
 				inode->i_ino, pos, ret, iocb->ki_pos);
+#endif
+		}
 	} else {
 		iocb->ki_flags |= IOCB_DIRECT | IOCB_DSYNC;
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 		f2fs_info(sbi,
 			"swap_rw: READ -> f2fs_file_read_iter inode=%lu pos=%lld count=%zu",
 			inode->i_ino, iocb->ki_pos, count);
+#endif
 
 		ret = f2fs_file_read_iter(iocb, iter);
 
-		if (ret < 0)
+		if (ret < 0 && ret != -EIOCBQUEUED) {
 			f2fs_err(sbi,
 				"swap_rw: READ FAILED inode=%lu pos_in=%lld count=%zu ret=%d",
 				inode->i_ino, pos, count, ret);
-		else
+		} else {
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 			f2fs_info(sbi,
-				"swap_rw: READ OK inode=%lu pos_in=%lld bytes=%d new_pos=%lld",
+				"swap_rw: READ %s inode=%lu pos_in=%lld bytes=%d new_pos=%lld",
+				(ret == -EIOCBQUEUED) ? "QUEUED" : "OK",
 				inode->i_ino, pos, ret, iocb->ki_pos);
+#endif
+		}
 	}
 
 	return ret;
@@ -4528,7 +4546,7 @@ static int f2fs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 	if (WARN_ON_ONCE(map.m_pblk == COMPRESS_ADDR))
 		return -EINVAL;
 
-	if (map.m_pblk != NULL_ADDR) {
+	if (map.m_pblk != NULL_ADDR || (map.m_flags & F2FS_MAP_MAPPED)) {
 		iomap->length = blks_to_bytes(inode, map.m_len);
 		iomap->type = IOMAP_MAPPED;
 		iomap->flags |= IOMAP_F_MERGED;
@@ -4543,6 +4561,7 @@ static int f2fs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 
 		/* Debug: show which device this I/O is targeting */
 		if (iomap->bdev) {
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 			f2fs_info(sbi,
 				"iomap_begin: inode=%lu lblk=%u pblk=%llu len=%u "
 				"dev=%s multidev=%d flags=0x%x",
@@ -4550,6 +4569,7 @@ static int f2fs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 				map.m_len,
 				iomap->bdev->bd_disk->disk_name,
 				map.m_multidev_dio, flags);
+#endif
 		} else {
 			f2fs_err(sbi,
 				"iomap_begin: inode=%lu lblk=%u pblk=%llu "
@@ -4557,7 +4577,7 @@ static int f2fs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 				inode->i_ino, map.m_lblk, (u64)map.m_pblk,
 				map.m_multidev_dio, flags);
 			/* Fallback to superblock bdev to prevent crash */
-			iomap->bdev = inode->i_sb->s_bdev;
+			// iomap->bdev = inode->i_sb->s_bdev;
 		}
 	} else {
 		if (flags & IOMAP_WRITE) {
