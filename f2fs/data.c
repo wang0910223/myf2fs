@@ -1867,6 +1867,22 @@ next_block:
 		map->m_pblk = blkaddr;
 		map->m_len = 1;
 
+		/*
+		 * In LFS mode, if we are allocating new blocks, the physical 
+		 * addresses will NOT be contiguous across segment boundaries.
+		 * Cap end to prevent crossing the segment boundary and
+		 * stranding the newly allocated block.
+		 */
+		if (f2fs_lfs_mode(sbi) && __is_valid_data_blkaddr(blkaddr)) {
+			unsigned int blkoff = GET_BLKOFF_FROM_SEG0(sbi, blkaddr);
+			unsigned int segno = GET_SEGNO(sbi, blkaddr);
+			unsigned int usable_blocks = f2fs_usable_blks_in_seg(sbi, segno);
+			unsigned int blocks_left = usable_blocks > blkoff ? 
+								usable_blocks - blkoff : 0;
+			if (end > pgofs + blocks_left)
+				end = pgofs + blocks_left;
+		}
+
 		if (map->m_multidev_dio) {
 			map->m_bdev = FDEV(bidx).bdev;
 #ifdef CONFIG_F2FS_SWAP_DEBUG
