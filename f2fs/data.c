@@ -21,6 +21,7 @@
 #include <linux/sched/signal.h>
 #include <linux/fiemap.h>
 #include <linux/iomap.h>
+#include <linux/moduleparam.h>
 
 #include "f2fs.h"
 #include "node.h"
@@ -4238,6 +4239,10 @@ out:
 	return ret;
 }
 
+static bool force_swap_fs_ops = false;
+module_param(force_swap_fs_ops, bool, 0644);
+MODULE_PARM_DESC(force_swap_fs_ops, "Force routing swapfile I/O through F2FS SWP_FS_OPS");
+
 static int f2fs_swap_activate(struct swap_info_struct *sis, struct file *file,
 				sector_t *span)
 {
@@ -4255,15 +4260,14 @@ static int f2fs_swap_activate(struct swap_info_struct *sis, struct file *file,
 	 * ZNS devices require sequential writes only.  Traditional swap
 	 * uses direct BIO with random overwrites, which violates ZNS
 	 * constraints.  When the filesystem is mounted on a zoned block
-	 * device (blkzoned feature) and operates in LFS mode, we instead
-	 * set SWP_FS_OPS so that all swap I/O is routed back through
-	 * f2fs_swap_rw(), allowing F2FS's log-structured write path to
-	 * convert random swap writes into sequential, ZNS-compatible
-	 * writes via out-of-place updates.
+	 * device (blkzoned feature) and operates in LFS mode (or when
+	 * force_swap_fs_ops is enabled), we instead set SWP_FS_OPS so
+	 * that all swap I/O is routed back through f2fs_swap_rw().
 	 */
-	if (f2fs_sb_has_blkzoned(sbi) && f2fs_lfs_mode(sbi)) {
+	if (force_swap_fs_ops || (f2fs_sb_has_blkzoned(sbi) && f2fs_lfs_mode(sbi))) {
 		f2fs_info(sbi,
-			"ZNS swapfile: enabling SWP_FS_OPS to route I/O via f2fs");
+			"Swapfile: enabling SWP_FS_OPS to route I/O via f2fs (force=%d)",
+			force_swap_fs_ops);
 		ret = f2fs_convert_inline_inode(inode);
 		if (ret)
 			return ret;
@@ -4323,11 +4327,10 @@ static void f2fs_swap_deactivate(struct file *file)
 
 	stat_dec_swapfile_inode(inode);
 	/*
-	 * In ZNS/LFS mode we never set FI_PIN_FILE (because blocks are
-	 * managed out-of-place), so only clear it for the conventional
-	 * (non-ZNS) swap path.
+	 * We only set FI_PIN_FILE for the conventional (non-SWP_FS_OPS)
+	 * swap path, so only clear it if we didn't use FS ops.
 	 */
-	if (!(f2fs_sb_has_blkzoned(sbi) && f2fs_lfs_mode(sbi)))
+	if (!(force_swap_fs_ops || (f2fs_sb_has_blkzoned(sbi) && f2fs_lfs_mode(sbi))))
 		clear_inode_flag(inode, FI_PIN_FILE);
 }
 
