@@ -4637,6 +4637,118 @@ static int f2fs_dio_write_end_io(struct kiocb *iocb, ssize_t size, int error,
 	return 0;
 }
 
+static void f2fs_swap_zone_append_end_io(struct bio *bio)
+{
+	struct f2fs_za_bio_ctx *ctx = bio->bi_private;
+	struct inode *inode = ctx->inode;
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+	/* actual_blkaddr here is the GLOBAL block address */
+	block_t actual_blkaddr = (bio->bi_iter.bi_sector >> (sbi->log_blocksize - SECTOR_SHIFT)) + ctx->dev_start_blk;
+	struct f2fs_node *rn;
+	struct f2fs_summary_block *sum_blk;
+	unsigned long flags;
+	unsigned int segno;
+	int nr_blocks = bio->bi_iter.bi_size >> sbi->log_blocksize;
+	int i;
+
+	if (bio->bi_status) {
+		f2fs_err(sbi, "[ZNS] ZONE_APPEND bio failed! status=%d", bio->bi_status);
+		goto out;
+	}
+
+
+
+	if (actual_blkaddr != ctx->prealloc_blkaddr && sbi->is_cxl_dax) {
+		spin_lock_irqsave(&sbi->cxl_meta_lock, flags);
+
+		/* 1. Update Node Page */
+		rn = (struct f2fs_node *)((char *)sbi->cxl_base_addr +
+			(ctx->node_blkaddr << sbi->log_blocksize));
+		
+		for (i = 0; i < nr_blocks; i++) {
+			rn->i.i_addr[ctx->node_ofs + i] = cpu_to_le32(actual_blkaddr + i);
+
+			/* 2. Update SSA (Reverse map) */
+			segno = GET_SEGNO(sbi, actual_blkaddr + i);
+			sum_blk = (struct f2fs_summary_block *)((char *)sbi->cxl_base_addr +
+				(GET_SUM_BLOCK(sbi, segno) << sbi->log_blocksize));
+			sum_blk->entries[GET_BLKOFF_FROM_SEG0(sbi, actual_blkaddr + i)].nid = cpu_to_le32(rn->footer.nid);
+			sum_blk->entries[GET_BLKOFF_FROM_SEG0(sbi, actual_blkaddr + i)].ofs_in_node = cpu_to_le16(ctx->node_ofs + i);
+		}
+
+		spin_unlock_irqrestore(&sbi->cxl_meta_lock, flags);
+	}
+
+out:
+	bio->bi_end_io = ctx->orig_bi_end_io;
+	bio->bi_private = ctx->orig_bi_private;
+	mempool_free(ctx, sbi->za_ctx_pool);
+	if (bio->bi_end_io)
+		bio->bi_end_io(bio);
+}
+
+static void f2fs_swap_zone_append_submit_io(const struct iomap_iter *iter,
+					struct bio *bio, loff_t file_offset)
+{
+	struct inode *inode = iter->inode;
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+	struct f2fs_za_bio_ctx *ctx;
+
+	u64 node_info;
+	block_t dev_start_blk = 0;
+	int i;
+
+	if (sbi->s_ndevs > 1) {
+		for (i = 0; i < sbi->s_ndevs; i++) {
+			if (FDEV(i).bdev == bio->bi_bdev) {
+				dev_start_blk = FDEV(i).start_blk;
+				break;
+			}
+		}
+	}
+
+	ctx = mempool_alloc(sbi->za_ctx_pool, GFP_NOIO);
+	ctx->orig_bio = bio;
+	ctx->orig_bi_end_io = bio->bi_end_io;
+	ctx->orig_bi_private = bio->bi_private;
+	ctx->inode = inode;
+	ctx->logical_page_idx = file_offset >> sbi->log_blocksize;
+	
+	/* The sector here is device-relative. We need the global block address for tracking */
+	ctx->prealloc_blkaddr = (bio->bi_iter.bi_sector >> (sbi->log_blocksize - SECTOR_SHIFT)) + dev_start_blk;
+	ctx->dev_start_blk = dev_start_blk;
+	
+	node_info = (u64)iter->iomap.private;
+	ctx->node_blkaddr = (block_t)(node_info >> 32);
+	ctx->node_ofs = (unsigned int)(node_info & 0xFFFFFFFF);
+
+	bio->bi_private = ctx;
+	bio->bi_end_io = f2fs_swap_zone_append_end_io;
+
+	/* 
+	 * NVMe ZNS ZONE_APPEND MUST have bi_sector aligned to the start of the zone.
+	 * The current bi_sector is the exact allocated block, which is likely NOT the start of the zone.
+	 */
+	if (bdev_is_zoned(bio->bi_bdev)) {
+		sector_t zone_sectors = bdev_zone_sectors(bio->bi_bdev);
+		sector_t zslba = bio->bi_iter.bi_sector;
+		sector_t remainder;
+		div64_u64_rem(zslba, zone_sectors, &remainder);
+		bio->bi_iter.bi_sector = zslba - remainder;
+	}
+
+	bio->bi_opf = REQ_OP_ZONE_APPEND | (bio->bi_opf & ~REQ_OP_MASK);
+
+
+
+	submit_bio(bio);
+}
+
+const struct iomap_dio_ops f2fs_swap_zone_append_dio_ops = {
+	.submit_io = f2fs_swap_zone_append_submit_io,
+	.end_io = f2fs_dio_write_end_io,
+};
+
 static const struct iomap_dio_ops f2fs_iomap_dio_write_ops = {
 	.end_io = f2fs_dio_write_end_io,
 };
@@ -4707,11 +4819,14 @@ static ssize_t f2fs_dio_write_iter(struct kiocb *iocb, struct iov_iter *from,
 	if (pos + count > inode->i_size)
 		dio_flags |= IOMAP_DIO_FORCE_WAIT;
 
-	/* Force synchronous DIO for swapfile on zoned devices to prevent out-of-order writes */
-	if (f2fs_sb_has_blkzoned(sbi) && IS_SWAPFILE(inode))
-		dio_flags |= IOMAP_DIO_FORCE_WAIT;
-	dio = __iomap_dio_rw(iocb, from, &f2fs_iomap_ops,
-			     &f2fs_iomap_dio_write_ops, dio_flags, NULL, 0);
+	/* Use ZONE_APPEND for swapfile on zoned devices */
+	if (f2fs_sb_has_blkzoned(sbi) && IS_SWAPFILE(inode)) {
+		dio = __iomap_dio_rw(iocb, from, &f2fs_iomap_ops,
+				     &f2fs_swap_zone_append_dio_ops, dio_flags, NULL, 0);
+	} else {
+		dio = __iomap_dio_rw(iocb, from, &f2fs_iomap_ops,
+				     &f2fs_iomap_dio_write_ops, dio_flags, NULL, 0);
+	}
 	if (IS_ERR_OR_NULL(dio)) {
 		ret = PTR_ERR_OR_ZERO(dio);
 		if (ret == -ENOTBLK)

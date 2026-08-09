@@ -3557,7 +3557,6 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 					sbi->log_blocks_per_seg);
 		if (curseg->segno < zns_start_seg) {
 			f2fs_info(sbi, "[ZNS-ALLOCATOR] Forcing new_curseg for initial COLD_DATA to ZNS device");
-			printk_ratelimited("[ZNS-ALLOCATOR] Forcing new_curseg for initial COLD_DATA to ZNS device");
 			if(f2fs_zns_swap_seg(sbi, type)){
 				new_curseg(sbi, type, true);
 			}
@@ -3568,6 +3567,8 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 			stat_inc_seg_type(sbi, curseg);
 		}
 	}
+
+
 
 	*new_blkaddr = NEXT_FREE_BLKADDR(sbi, curseg);
 	if(f2fs_zns_swap_seg(sbi, type) && curseg->alloc_type == SSR)

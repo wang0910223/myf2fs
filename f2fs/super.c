@@ -1762,6 +1762,7 @@ static void f2fs_put_super(struct super_block *sb)
 
 	f2fs_destroy_page_array_cache(sbi);
 	f2fs_destroy_xattr_caches(sbi);
+	mempool_destroy(sbi->za_ctx_pool);
 	mempool_destroy(sbi->write_io_dummy);
 #ifdef CONFIG_QUOTA
 	for (i = 0; i < MAXQUOTAS; i++)
@@ -4723,6 +4724,15 @@ try_onemore:
 		}
 	}
 
+	/* Initialize ZNS Swapfile CXL metadata context pool and lock */
+	spin_lock_init(&sbi->cxl_meta_lock);
+	sbi->za_ctx_pool = mempool_create_kmalloc_pool(128, sizeof(struct f2fs_za_bio_ctx));
+	if (!sbi->za_ctx_pool) {
+		err = -ENOMEM;
+		goto free_io_dummy;
+	}
+
+
 	/* init per sbi slab cache */
 	err = f2fs_init_xattr_caches(sbi);
 	if (err)
@@ -5049,6 +5059,7 @@ free_page_array_cache:
 free_xattr_cache:
 	f2fs_destroy_xattr_caches(sbi);
 free_io_dummy:
+	mempool_destroy(sbi->za_ctx_pool);
 	mempool_destroy(sbi->write_io_dummy);
 free_percpu:
 	destroy_percpu_info(sbi);

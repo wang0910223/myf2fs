@@ -714,6 +714,8 @@ struct f2fs_map_blocks {
 	struct block_device *m_bdev;	/* for multi-device dio */
 	block_t m_pblk;
 	block_t m_lblk;
+	block_t m_node_blkaddr;
+	unsigned int m_node_ofs;
 	unsigned int m_len;
 	unsigned int m_flags;
 	pgoff_t *m_next_pgofs;		/* point next possible non-hole pgofs */
@@ -1561,6 +1563,18 @@ struct decompress_io_ctx {
 #define MAX_COMPRESS_LOG_SIZE		8
 #define MAX_COMPRESS_WINDOW_SIZE(log_size)	((PAGE_SIZE) << (log_size))
 
+struct f2fs_za_bio_ctx {
+	struct bio *orig_bio;
+	bio_end_io_t *orig_bi_end_io;
+	void *orig_bi_private;
+	struct inode *inode;
+	pgoff_t logical_page_idx;
+	block_t prealloc_blkaddr;
+	block_t node_blkaddr;
+	unsigned int node_ofs;
+	block_t dev_start_blk;
+};
+
 struct f2fs_sb_info {
 	/* --- NEW: CXL DAX Native Support --- */
     bool is_cxl_dax;                   /* 標記是否為 CXL DAX 模式 */
@@ -1838,6 +1852,10 @@ struct f2fs_sb_info {
 	spinlock_t iostat_lat_lock;
 	struct iostat_lat_info *iostat_io_lat;
 #endif
+
+	/* For CXL ZNS swap metadata update */
+	spinlock_t cxl_meta_lock;
+	mempool_t *za_ctx_pool;
 };
 
 #ifdef CONFIG_F2FS_FAULT_INJECTION

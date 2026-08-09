@@ -1868,6 +1868,15 @@ next_block:
 		map->m_pblk = blkaddr;
 		map->m_len = 1;
 
+		if (f2fs_sb_has_blkzoned(sbi) && IS_SWAPFILE(inode)) {
+			struct node_info ni;
+			if (!f2fs_get_node_info(sbi, dn.nid, &ni, false)) {
+				map->m_node_blkaddr = ni.blk_addr;
+				map->m_node_ofs = dn.ofs_in_node;
+			}
+		}
+
+
 		/*
 		 * In LFS mode, if we are allocating new blocks, the physical 
 		 * addresses will NOT be contiguous across segment boundaries.
@@ -4572,8 +4581,10 @@ static int f2fs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 		iomap->bdev = map.m_bdev;
 		iomap->addr = blks_to_bytes(inode, map.m_pblk);
 
-		/* Flag CXL device for f2fs_dio_submit_io */
-		if (!map.m_bdev && sbi->is_cxl_dax)
+		/* Flag CXL device or pass node info for ZNS Swapfile */
+		if (f2fs_sb_has_blkzoned(sbi) && IS_SWAPFILE(inode))
+			iomap->private = (void *)(((u64)map.m_node_blkaddr << 32) | map.m_node_ofs);
+		else if (!map.m_bdev && sbi->is_cxl_dax)
 			iomap->private = (void *)1;
 		else
 			iomap->private = NULL;
