@@ -4399,6 +4399,17 @@ static int f2fs_swap_rw(struct kiocb *iocb, struct iov_iter *iter)
 			inode->i_ino, iocb->ki_pos, count);
 #endif
 
+		/*
+		 * FORCE clear any stray page cache pages (e.g., from GC or buffered read fallback).
+		 * In multithreaded environments, kiocb_invalidate_pages inside __iomap_dio_rw 
+		 * will return -EBUSY if these pages are locked or under writeback, causing 
+		 * the DIO write to silently fail and fall back to buffered IO.
+		 * Buffered IO for a pinned LFS file fails with -EOPNOTSUPP, causing
+		 * a "Write error 0" and leading to OOM crash.
+		 */
+		truncate_inode_pages_range(inode->i_mapping, iocb->ki_pos,
+					   iocb->ki_pos + count - 1);
+
 		ret = f2fs_file_write_iter(iocb, iter);
 
 		if (ret < 0 && ret != -EIOCBQUEUED) {
