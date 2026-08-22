@@ -2753,9 +2753,11 @@ static void get_new_segment(struct f2fs_sb_info *sbi,
 		zns_start_sec = ((FDEV(1).start_blk - MAIN_BLKADDR(sbi)) >>
 					sbi->log_blocks_per_seg) / sbi->segs_per_sec;
 		if (hint < zns_start_sec) {
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 			f2fs_info(sbi,
 				"[ZNS-ALLOCATOR] Redirecting COLD_DATA (swap) allocation: section %u -> %u (ZNS Device 1)",
 				hint, zns_start_sec);
+#endif
 			hint = zns_start_sec;
 			new_sec = true;
 			*newseg = GET_SEG_FROM_SEC(sbi, zns_start_sec);
@@ -2922,6 +2924,8 @@ static void new_curseg(struct f2fs_sb_info *sbi, int type, bool new_sec)
 	if (F2FS_OPTION(sbi).fs_mode == FS_MODE_FRAGMENT_BLK)
 		curseg->fragment_remained_chunk =
 				get_random_u32_inclusive(1, sbi->max_fragment_chunk);
+
+
 }
 
 static int __next_free_blkoff(struct f2fs_sb_info *sbi,
@@ -2964,7 +2968,9 @@ static void change_curseg(struct f2fs_sb_info *sbi, int type)
 	struct f2fs_summary_block *sum_node;
 	struct page *sum_page;
 
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 	f2fs_err(sbi, "[ZNS-CHECK] change_curseg called! type=%d segno=%u", type, curseg->segno);
+#endif
 
 	write_sum_page(sbi, curseg->sum_blk, GET_SUM_BLOCK(sbi, curseg->segno));
 
@@ -2988,6 +2994,8 @@ static void change_curseg(struct f2fs_sb_info *sbi, int type)
 	sum_node = (struct f2fs_summary_block *)page_address(sum_page);
 	memcpy(curseg->sum_blk, sum_node, SUM_ENTRY_SIZE);
 	f2fs_put_page(sum_page, 1);
+
+
 }
 
 static int get_ssr_segment(struct f2fs_sb_info *sbi, int type,
@@ -3556,7 +3564,9 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 		unsigned int zns_start_seg = ((FDEV(1).start_blk - MAIN_BLKADDR(sbi)) >>
 					sbi->log_blocks_per_seg);
 		if (curseg->segno < zns_start_seg) {
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 			f2fs_info(sbi, "[ZNS-ALLOCATOR] Forcing new_curseg for initial COLD_DATA to ZNS device");
+#endif
 			if(f2fs_zns_swap_seg(sbi, type)){
 				new_curseg(sbi, type, true);
 			}
@@ -3571,8 +3581,10 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 
 
 	*new_blkaddr = NEXT_FREE_BLKADDR(sbi, curseg);
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 	if(f2fs_zns_swap_seg(sbi, type) && curseg->alloc_type == SSR)
 		f2fs_err(sbi, "[ZNS-BUG] SSR on ZNS! segno=%u next_blkoff=%u", curseg->segno, curseg->next_blkoff);
+#endif
 
 	f2fs_bug_on(sbi, curseg->next_blkoff >= sbi->blocks_per_seg);
 
@@ -3612,8 +3624,13 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 	 */
 	if (segment_full) {
 		if (from_gc) {
-			get_atssr_segment(sbi, type, se->type,
-						AT_SSR, se->mtime);
+			if(f2fs_zns_swap_seg(sbi, type)) {
+				new_curseg(sbi, type, false);
+				stat_inc_seg_type(sbi, curseg);
+			} else {
+				get_atssr_segment(sbi, type, se->type,
+							AT_SSR, se->mtime);
+			}
 		} else {
 			if(f2fs_zns_swap_seg(sbi, type)){
 				new_curseg(sbi, type, false);

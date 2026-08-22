@@ -715,6 +715,7 @@ struct f2fs_map_blocks {
 	block_t m_pblk;
 	block_t m_lblk;
 	block_t m_node_blkaddr;
+	nid_t m_nid;
 	unsigned int m_node_ofs;
 	unsigned int m_len;
 	unsigned int m_flags;
@@ -1571,6 +1572,7 @@ struct f2fs_za_bio_ctx {
 	pgoff_t logical_page_idx;
 	block_t prealloc_blkaddr;
 	block_t node_blkaddr;
+	nid_t nid;
 	unsigned int node_ofs;
 	block_t dev_start_blk;
 };
@@ -3911,6 +3913,7 @@ void f2fs_destroy_post_read_processing(void);
 int f2fs_init_post_read_wq(struct f2fs_sb_info *sbi);
 void f2fs_destroy_post_read_wq(struct f2fs_sb_info *sbi);
 extern const struct iomap_ops f2fs_iomap_ops;
+extern const struct iomap_dio_ops f2fs_swap_zone_append_dio_ops;
 
 /*
  * gc.c

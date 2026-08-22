@@ -597,13 +597,17 @@ static void f2fs_submit_write_bio(struct f2fs_sb_info *sbi, struct bio *bio,
         /* ========================================================= */
         if (bio_segments(bio) == 0) {
             /* 如果想看它有沒有發揮作用，可以把下面這行取消註解 */
+#ifdef CONFIG_F2FS_SWAP_DEBUG
             printk_ratelimited(KERN_INFO "F2FS-CXL: Intercepted empty FLUSH bio.\n");
+#endif
             bio->bi_status = BLK_STS_OK;
             bio_endio(bio); /* 扭開 wait_for_completion 的鑰匙！ */
             return;
         }
 		/* 建議把原本的 printk 改成 ratelimited，避免高負載時狂洗 Log */
+#ifdef CONFIG_F2FS_SWAP_DEBUG
         printk_ratelimited(KERN_INFO "F2FS-CXL: Intercepting write bio for CXL DAX device\n");
+#endif
 
 
 		
@@ -629,8 +633,10 @@ static void f2fs_submit_write_bio(struct f2fs_sb_info *sbi, struct bio *bio,
 	if (type == DATA || type == NODE) {
 
 		// 0425: CXL DAX sync
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 		printk_ratelimited(KERN_WARNING "F2FS-DEBUG: Sending bio to ZNS! sector=%llu, size=%u\n", 
                            (unsigned long long)bio->bi_iter.bi_sector, bio->bi_iter.bi_size);
+#endif
 		//---------------------------------------------
 		if (f2fs_lfs_mode(sbi) && current->plug)
 			blk_finish_plug(current->plug);
@@ -1693,6 +1699,14 @@ static bool f2fs_map_blocks_cached(struct inode *inode,
 	pgoff_t pgoff = (pgoff_t)map->m_lblk;
 	struct extent_info ei = {};
 
+	/* 
+	 * For ZNS Swapfiles, ZONE_APPEND updates the actual physical block address 
+	 * asynchronously in end_io, but does not update the Extent Cache.
+	 * Bypass the read extent cache to prevent returning stale predicted addresses.
+	 */
+	if (f2fs_sb_has_blkzoned(sbi) && IS_SWAPFILE(inode))
+		return false;
+
 	if (!f2fs_lookup_read_extent_cache(inode, pgoff, &ei))
 		return false;
 
@@ -1782,9 +1796,12 @@ next_dnode:
 
 next_block:
 	blkaddr = f2fs_data_blkaddr(&dn);
+
 	is_hole = !__is_valid_data_blkaddr(blkaddr);
 	if (!is_hole &&
-	    !f2fs_is_valid_blkaddr(sbi, blkaddr, DATA_GENERIC_ENHANCE)) {
+	    !f2fs_is_valid_blkaddr(sbi, blkaddr, 
+			(f2fs_sb_has_blkzoned(sbi) && IS_SWAPFILE(inode)) ? 
+			DATA_GENERIC : DATA_GENERIC_ENHANCE)) {
 		err = -EFSCORRUPTED;
 		f2fs_handle_error(sbi, ERROR_INVALID_BLKADDR);
 		goto sync_out;
@@ -1872,6 +1889,7 @@ next_block:
 			struct node_info ni;
 			if (!f2fs_get_node_info(sbi, dn.nid, &ni, false)) {
 				map->m_node_blkaddr = ni.blk_addr;
+				map->m_nid = dn.nid;
 				map->m_node_ofs = dn.ofs_in_node;
 			}
 		}
@@ -1938,6 +1956,16 @@ skip:
 		goto sync_out;
 	else if (dn.ofs_in_node < end_offset)
 		goto next_block;
+
+	/* 
+	 * For ZNS Swapfiles, we pack node_blkaddr and node_ofs into iomap->private
+	 * for a single Node Page. If the extent crosses a node boundary, end_io
+	 * will overflow the node array. Stop the mapping here to force iomap to 
+	 * split the BIO at the node boundary.
+	 */
+	if (f2fs_sb_has_blkzoned(sbi) && IS_SWAPFILE(inode))
+		goto sync_out;
+
 
 	if (flag == F2FS_GET_BLOCK_PRECACHE) {
 		if (map->m_flags & F2FS_MAP_MAPPED) {
@@ -4410,8 +4438,33 @@ static int f2fs_swap_rw(struct kiocb *iocb, struct iov_iter *iter)
 		truncate_inode_pages_range(inode->i_mapping, iocb->ki_pos,
 					   iocb->ki_pos + count - 1);
 
-		ret = f2fs_file_write_iter(iocb, iter);
+		if (f2fs_sb_has_blkzoned(sbi)) {
+			struct iomap_dio *dio;
 
+			/* Defensive programming: check for checkpoint error */
+			if (unlikely(f2fs_cp_error(sbi))) {
+				ret = -EIO;
+				goto out;
+			}
+
+			/* 
+			 * BYPASS f2fs_file_write_iter() and inode_lock() entirely!
+			 * Since this is a pinned, preallocated swapfile, we do not need 
+			 * VFS generic_write_checks or F2FS GC locks. 
+			 * This enables true lock-free concurrent submission.
+			 */
+			dio = __iomap_dio_rw(iocb, iter, &f2fs_iomap_ops,
+					     &f2fs_swap_zone_append_dio_ops, 0, NULL, 0);
+
+			if (IS_ERR_OR_NULL(dio))
+				ret = PTR_ERR_OR_ZERO(dio);
+			else
+				ret = iomap_dio_complete(dio);
+		} else {
+			ret = f2fs_file_write_iter(iocb, iter);
+		}
+
+out:
 		if (ret < 0 && ret != -EIOCBQUEUED) {
 			f2fs_err(sbi,
 				"swap_rw: WRITE FAILED inode=%lu pos_in=%lld count=%zu ret=%d",
@@ -4594,7 +4647,7 @@ static int f2fs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 
 		/* Flag CXL device or pass node info for ZNS Swapfile */
 		if (f2fs_sb_has_blkzoned(sbi) && IS_SWAPFILE(inode))
-			iomap->private = (void *)(((u64)map.m_node_blkaddr << 32) | map.m_node_ofs);
+			iomap->private = (void *)(((u64)map.m_nid << 16) | map.m_node_ofs);
 		else if (!map.m_bdev && sbi->is_cxl_dax)
 			iomap->private = (void *)1;
 		else

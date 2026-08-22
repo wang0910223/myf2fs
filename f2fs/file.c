@@ -560,9 +560,11 @@ static int f2fs_file_open(struct inode *inode, struct file *filp)
 		if (strstr(filp->f_path.dentry->d_name.name, "swap") ||
 		    strstr(filp->f_path.dentry->d_name.name, "SWAP")) {
 			inode->i_write_hint = WRITE_LIFE_EXTREME;
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 			f2fs_info(F2FS_I_SB(inode),
 				"[ZNS-SWAP-DETECTOR] Auto-detected swapfile '%s' (ino=%lu)! Set WRITE_LIFE_EXTREME -> COLD_DATA",
 				filp->f_path.dentry->d_name.name, inode->i_ino);
+#endif
 		}
 	}
 
@@ -4656,23 +4658,48 @@ static void f2fs_swap_zone_append_end_io(struct bio *bio)
 		goto out;
 	}
 
-
+#ifdef CONFIG_F2FS_SWAP_DEBUG
+	printk_ratelimited(KERN_ERR "F2FS-ZNS: end_io! prealloc=%u, actual=%u, bi_sector=%llu\n",
+			   ctx->prealloc_blkaddr, actual_blkaddr, (unsigned long long)bio->bi_iter.bi_sector);
+#endif
 
 	if (actual_blkaddr != ctx->prealloc_blkaddr && sbi->is_cxl_dax) {
 		spin_lock_irqsave(&sbi->cxl_meta_lock, flags);
 
 		/* 1. Update Node Page */
-		rn = (struct f2fs_node *)((char *)sbi->cxl_base_addr +
-			(ctx->node_blkaddr << sbi->log_blocksize));
-		
+		if (ctx->node_blkaddr != 0) {
+			rn = (struct f2fs_node *)((char *)sbi->cxl_base_addr +
+				(ctx->node_blkaddr << sbi->log_blocksize));
+			
+			for (i = 0; i < nr_blocks; i++) {
+				__le32 *addr_array = blkaddr_in_node(rn);
+				addr_array[ctx->node_ofs + i] = cpu_to_le32(actual_blkaddr + i);
+			}
+		}
+
 		for (i = 0; i < nr_blocks; i++) {
-			rn->i.i_addr[ctx->node_ofs + i] = cpu_to_le32(actual_blkaddr + i);
+			/* 
+			 * [ZNS CXL Swapfile FIX Phase 2]
+			 * F2FS __allocate_data_block dirties the Linux Page Cache Node Page with a PREDICTED block address.
+			 * When Checkpoint runs, it flushes this dirty page, OVERWRITING our true actual_blkaddr in CXL!
+			 * We MUST sync the true actual_blkaddr back to the Page Cache to prevent this corruption!
+			 */
+			{
+				struct page *node_page = find_get_page(NODE_MAPPING(sbi), ctx->nid);
+				if (node_page) {
+					struct f2fs_node *k_rn = F2FS_NODE(node_page);
+					__le32 *k_addr_array = blkaddr_in_node(k_rn);
+					k_addr_array[ctx->node_ofs + i] = cpu_to_le32(actual_blkaddr + i);
+					set_page_dirty(node_page);
+					put_page(node_page);
+				}
+			}
 
 			/* 2. Update SSA (Reverse map) */
 			segno = GET_SEGNO(sbi, actual_blkaddr + i);
 			sum_blk = (struct f2fs_summary_block *)((char *)sbi->cxl_base_addr +
 				(GET_SUM_BLOCK(sbi, segno) << sbi->log_blocksize));
-			sum_blk->entries[GET_BLKOFF_FROM_SEG0(sbi, actual_blkaddr + i)].nid = cpu_to_le32(rn->footer.nid);
+			sum_blk->entries[GET_BLKOFF_FROM_SEG0(sbi, actual_blkaddr + i)].nid = cpu_to_le32(ctx->nid);
 			sum_blk->entries[GET_BLKOFF_FROM_SEG0(sbi, actual_blkaddr + i)].ofs_in_node = cpu_to_le16(ctx->node_ofs + i);
 		}
 
@@ -4719,8 +4746,17 @@ static void f2fs_swap_zone_append_submit_io(const struct iomap_iter *iter,
 	ctx->dev_start_blk = dev_start_blk;
 	
 	node_info = (u64)iter->iomap.private;
-	ctx->node_blkaddr = (block_t)(node_info >> 32);
-	ctx->node_ofs = (unsigned int)(node_info & 0xFFFFFFFF);
+	ctx->nid = (nid_t)(node_info >> 16);
+	ctx->node_ofs = (unsigned int)(node_info & 0xFFFF);
+	
+	/* Call f2fs_get_node_info to get the real physical block address of the node page */
+	{
+		struct node_info ni;
+		if (!f2fs_get_node_info(sbi, ctx->nid, &ni, false))
+			ctx->node_blkaddr = ni.blk_addr;
+		else
+			ctx->node_blkaddr = 0; /* Fallback if failed */
+	}
 
 	bio->bi_private = ctx;
 	bio->bi_end_io = f2fs_swap_zone_append_end_io;
@@ -4746,7 +4782,7 @@ static void f2fs_swap_zone_append_submit_io(const struct iomap_iter *iter,
 
 const struct iomap_dio_ops f2fs_swap_zone_append_dio_ops = {
 	.submit_io = f2fs_swap_zone_append_submit_io,
-	.end_io = f2fs_dio_write_end_io,
+	.end_io = NULL,
 };
 
 static const struct iomap_dio_ops f2fs_iomap_dio_write_ops = {
@@ -4917,7 +4953,9 @@ ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	ret = f2fs_write_checks(iocb, from);
 	if (ret < 0)
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 		printk(KERN_ERR "F2FS-CXL: f2fs_write_checks returned %zd\n", ret);
+#endif
 	if (ret <= 0)
 		goto out_unlock;
 

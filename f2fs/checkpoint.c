@@ -1095,7 +1095,9 @@ retry:
         /* 當員工發現清單已經空了，但老闆的帳本還有記錄時，強制清零 */
         /* ========================================================= */
         if (unlikely(get_pages(sbi, type_count) > 0)) {
+#ifdef CONFIG_F2FS_SWAP_DEBUG
             printk_ratelimited(KERN_WARNING "F2FS-CXL: Fixing F2FS global accounting mismatch! List is empty but counter > 0\n");
+#endif
             while (get_pages(sbi, type_count) > 0) {
                 dec_page_count(sbi, type_count);
             }
@@ -1123,12 +1125,16 @@ retry:
         int dirty_count = atomic_read(&F2FS_I(inode)->dirty_pages);
 
         /* 保留監控輸出，建議改用 ratelimited 避免洗頻太嚴重 */
+#ifdef CONFIG_F2FS_SWAP_DEBUG
         printk_ratelimited(KERN_INFO "F2FS-DEBUG: Syncing Inode: %lu, dirty_pages: %d\n", 
                            inode->i_ino, dirty_count);
+#endif
 
         /* 狀況 A：計數器已經是 0，代表資料早寫完了，但清單沒更新 */
         if (dirty_count == 0) {
+#ifdef CONFIG_F2FS_SWAP_DEBUG
             printk_ratelimited(KERN_WARNING "F2FS-CXL: Ripping out ghost Inode %lu\n", inode->i_ino);
+#endif
             
             /* 🚨 正確寫法：剪斷鐵鍊，如果是目錄才撕標籤 */
             spin_lock(&sbi->inode_lock[type]);
@@ -1148,7 +1154,9 @@ retry:
          * 狀態一定會在這行之前被清掉。如果計數器完全沒變，代表 VFS 罷工了！
          */
         if (dirty_count == atomic_read(&F2FS_I(inode)->dirty_pages)) {
+#ifdef CONFIG_F2FS_SWAP_DEBUG
             printk_ratelimited(KERN_WARNING "F2FS-CXL: Force clearing stuck dirty_pages for Inode %lu\n", inode->i_ino);
+#endif
             
             /* 強制將計數器歸零，打破死鎖！ */
             atomic_set(&F2FS_I(inode)->dirty_pages, 0);
@@ -1196,7 +1204,9 @@ skip_write:
         spin_lock(&sbi->inode_lock[type]);
         
         if (!list_empty(&fi->dirty_list)) {
+#ifdef CONFIG_F2FS_SWAP_DEBUG
             printk_ratelimited(KERN_WARNING "F2FS-CXL: Force removing dead igrab(NULL) Inode %lu\n", fi->vfs_inode.i_ino);
+#endif
             
             /* 記錄要扣減的私有髒頁數 */
             int dead_dirty_count = atomic_read(&fi->dirty_pages);
