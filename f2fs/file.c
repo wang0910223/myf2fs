@@ -4639,6 +4639,23 @@ static int f2fs_dio_write_end_io(struct kiocb *iocb, ssize_t size, int error,
 	return 0;
 }
 
+static void f2fs_swap_zone_append_work(struct work_struct *work)
+{
+	struct f2fs_za_bio_ctx *ctx = container_of(work, struct f2fs_za_bio_ctx, work);
+	struct inode *inode = ctx->inode;
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+	int nr_blocks = ctx->orig_bio->bi_iter.bi_size >> sbi->log_blocksize;
+
+	f2fs_update_sit_for_zns_swap(sbi, ctx->prealloc_blkaddr, ctx->actual_blkaddr, nr_blocks);
+
+	ctx->orig_bio->bi_end_io = ctx->orig_bi_end_io;
+	ctx->orig_bio->bi_private = ctx->orig_bi_private;
+	if (ctx->orig_bio->bi_end_io)
+		ctx->orig_bio->bi_end_io(ctx->orig_bio);
+
+	mempool_free(ctx, sbi->za_ctx_pool);
+}
+
 static void f2fs_swap_zone_append_end_io(struct bio *bio)
 {
 	struct f2fs_za_bio_ctx *ctx = bio->bi_private;
@@ -4704,6 +4721,12 @@ static void f2fs_swap_zone_append_end_io(struct bio *bio)
 		}
 
 		spin_unlock_irqrestore(&sbi->cxl_meta_lock, flags);
+
+		/* Defer SIT update and BIO completion to a workqueue */
+		ctx->actual_blkaddr = actual_blkaddr;
+		INIT_WORK(&ctx->work, f2fs_swap_zone_append_work);
+		queue_work(system_unbound_wq, &ctx->work);
+		return;
 	}
 
 out:

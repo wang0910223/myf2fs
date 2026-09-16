@@ -3535,6 +3535,52 @@ static void f2fs_randomize_chunk(struct f2fs_sb_info *sbi,
 static inline bool f2fs_zns_swap_seg(struct f2fs_sb_info *sbi, int type){
 	return f2fs_sb_has_blkzoned(sbi) && f2fs_lfs_mode(sbi);
 }
+
+void f2fs_update_sit_for_zns_swap(struct f2fs_sb_info *sbi, block_t prealloc_blkaddr,
+		block_t actual_blkaddr, int nr_blocks)
+{
+	block_t a = actual_blkaddr;
+	block_t p = prealloc_blkaddr;
+	block_t a_end = actual_blkaddr + nr_blocks;
+	block_t p_end = prealloc_blkaddr + nr_blocks;
+
+	block_t cur_a = a;
+	block_t cur_p = p;
+
+	down_write(&SIT_I(sbi)->sentry_lock);
+	
+	while (cur_a < a_end) {
+		/* If cur_a is in [p, p_end-1], it's in the intersection, skip it */
+		if (cur_a >= p && cur_a < p_end) {
+			cur_a++;
+			continue;
+		}
+
+		/* cur_a is in A_only */
+		unsigned int segno = GET_SEGNO(sbi, cur_a);
+		unsigned int offset = GET_BLKOFF_FROM_SEG0(sbi, cur_a);
+		struct seg_entry *se = get_seg_entry(sbi, segno);
+
+		if (!f2fs_test_bit(offset, (char *)se->cur_valid_map)) {
+			/* Not a permutation, we need to set it */
+			update_sit_entry(sbi, cur_a, 1);
+
+			/* We also need to clear one block from P_only */
+			while (cur_p < p_end) {
+				if (cur_p < a || cur_p >= a_end) {
+					/* cur_p is in P_only */
+					update_sit_entry(sbi, cur_p, -1);
+					cur_p++; /* move to next for future use */
+					break;
+				}
+				cur_p++;
+			}
+		}
+		cur_a++;
+	}
+	up_write(&SIT_I(sbi)->sentry_lock);
+}
+
 void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 		block_t old_blkaddr, block_t *new_blkaddr,
 		struct f2fs_summary *sum, int type,

@@ -1575,6 +1575,8 @@ struct f2fs_za_bio_ctx {
 	nid_t nid;
 	unsigned int node_ofs;
 	block_t dev_start_blk;
+	block_t actual_blkaddr;
+	struct work_struct work;
 };
 
 struct f2fs_sb_info {
@@ -3773,6 +3775,8 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 			block_t old_blkaddr, block_t *new_blkaddr,
 			struct f2fs_summary *sum, int type,
 			struct f2fs_io_info *fio);
+void f2fs_update_sit_for_zns_swap(struct f2fs_sb_info *sbi, block_t prealloc_blkaddr,
+		block_t actual_blkaddr, int nr_blocks);
 void f2fs_update_device_state(struct f2fs_sb_info *sbi, nid_t ino,
 					block_t blkaddr, unsigned int blkcnt);
 void f2fs_wait_on_page_writeback(struct page *page,
