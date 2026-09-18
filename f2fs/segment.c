@@ -3536,55 +3536,45 @@ static inline bool f2fs_zns_swap_seg(struct f2fs_sb_info *sbi, int type){
 	return f2fs_sb_has_blkzoned(sbi) && f2fs_lfs_mode(sbi);
 }
 
-void f2fs_update_sit_for_zns_swap(struct f2fs_sb_info *sbi, block_t prealloc_blkaddr,
-		block_t actual_blkaddr, int nr_blocks)
+/*
+ * Commit the true, post-ZONE_APPEND-completion block address for a single
+ * ZNS swap slot.
+ *
+ * For ZNS swap writes we never mark the speculative "prealloc" address
+ * valid in the SIT bitmap at allocation time (see the defer_sit path in
+ * f2fs_allocate_data_block()), because ZONE_APPEND may not actually land
+ * there. Instead the *only* place that ever touches the SIT bitmap or the
+ * node page's block pointer for a given slot is this function, called once
+ * per completed write, from f2fs_swap_zone_append_work().
+ *
+ * @old_blkaddr must be read from the node page immediately before it is
+ * overwritten with @new_blkaddr, both under the node page lock (see the
+ * caller), so it always reflects whatever the *previous* completed write
+ * for this exact slot left behind -- regardless of the order in which
+ * concurrent writers to this slot happened to submit their I/O. This makes
+ * the bitmap correction self-consistent based on completion order alone,
+ * with no dependency on submission ordering or any prealloc/actual range
+ * arithmetic.
+ */
+void f2fs_zns_swap_commit_block(struct f2fs_sb_info *sbi, block_t old_blkaddr,
+		block_t new_blkaddr)
 {
-	block_t a = actual_blkaddr;
-	block_t p = prealloc_blkaddr;
-	block_t a_end = actual_blkaddr + nr_blocks;
-	block_t p_end = prealloc_blkaddr + nr_blocks;
-
-	block_t cur_a = a;
-	block_t cur_p = p;
-
 	down_write(&SIT_I(sbi)->sentry_lock);
-	
-	while (cur_a < a_end) {
-		/* If cur_a is in [p, p_end-1], it's in the intersection, skip it */
-		if (cur_a >= p && cur_a < p_end) {
-			cur_a++;
-			continue;
-		}
 
-		/* cur_a is in A_only */
-		unsigned int segno = GET_SEGNO(sbi, cur_a);
-		unsigned int offset = GET_BLKOFF_FROM_SEG0(sbi, cur_a);
-		struct seg_entry *se = get_seg_entry(sbi, segno);
+	update_sit_entry(sbi, new_blkaddr, 1);
+	if (GET_SEGNO(sbi, old_blkaddr) != NULL_SEGNO)
+		update_sit_entry(sbi, old_blkaddr, -1);
 
-		if (!f2fs_test_bit(offset, (char *)se->cur_valid_map)) {
-			/* Not a permutation, we need to set it */
-			update_sit_entry(sbi, cur_a, 1);
+	locate_dirty_segment(sbi, GET_SEGNO(sbi, old_blkaddr));
+	locate_dirty_segment(sbi, GET_SEGNO(sbi, new_blkaddr));
 
-			/* We also need to clear one block from P_only */
-			while (cur_p < p_end) {
-				if (cur_p < a || cur_p >= a_end) {
-					/* cur_p is in P_only */
-					update_sit_entry(sbi, cur_p, -1);
-					cur_p++; /* move to next for future use */
-					break;
-				}
-				cur_p++;
-			}
-		}
-		cur_a++;
-	}
 	up_write(&SIT_I(sbi)->sentry_lock);
 }
 
 void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 		block_t old_blkaddr, block_t *new_blkaddr,
 		struct f2fs_summary *sum, int type,
-		struct f2fs_io_info *fio)
+		struct f2fs_io_info *fio, bool defer_sit)
 {
 	struct sit_info *sit_i = SIT_I(sbi);
 	struct curseg_info *curseg = CURSEG_I(sbi, type);
@@ -3659,10 +3649,20 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 	/*
 	 * SIT information should be updated before segment allocation,
 	 * since SSR needs latest valid block information.
+	 *
+	 * Exception: for ZNS swap writes (defer_sit), *new_blkaddr is only a
+	 * speculative "prealloc" address -- ZONE_APPEND may complete at a
+	 * different physical block, so marking it valid here would be wrong
+	 * and would have to be undone later. Instead the caller commits the
+	 * real address (and invalidates whatever the slot previously held)
+	 * once the true completion address is known; see
+	 * f2fs_zns_swap_commit_block().
 	 */
-	update_sit_entry(sbi, *new_blkaddr, 1);
-	if (GET_SEGNO(sbi, old_blkaddr) != NULL_SEGNO)
-		update_sit_entry(sbi, old_blkaddr, -1);
+	if (!defer_sit) {
+		update_sit_entry(sbi, *new_blkaddr, 1);
+		if (GET_SEGNO(sbi, old_blkaddr) != NULL_SEGNO)
+			update_sit_entry(sbi, old_blkaddr, -1);
+	}
 
 	/*
 	 * If the current segment is full, flush it out and replace it with a
@@ -3762,7 +3762,7 @@ static void do_write_page(struct f2fs_summary *sum, struct f2fs_io_info *fio)
 		f2fs_down_read(&fio->sbi->io_order_lock);
 reallocate:
 	f2fs_allocate_data_block(fio->sbi, fio->page, fio->old_blkaddr,
-			&fio->new_blkaddr, sum, type, fio);
+			&fio->new_blkaddr, sum, type, fio, false);
 	if (GET_SEGNO(fio->sbi, fio->old_blkaddr) != NULL_SEGNO)
 		f2fs_invalidate_internal_cache(fio->sbi, fio->old_blkaddr);
 

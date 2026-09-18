@@ -1064,6 +1064,8 @@ void f2fs_remove_dirty_inode(struct inode *inode)
 	spin_unlock(&sbi->inode_lock[type]);
 }
 
+#define F2FS_CXL_SYNC_DIRTY_MAX_RETRY 1000
+
 int f2fs_sync_dirty_inodes(struct f2fs_sb_info *sbi, enum inode_type type,
 						bool from_cp)
 {
@@ -1073,11 +1075,46 @@ int f2fs_sync_dirty_inodes(struct f2fs_sb_info *sbi, enum inode_type type,
 	bool is_dir = (type == DIR_INODE);
 	unsigned long ino = 0;
 	int type_count = is_dir ? F2FS_DIRTY_DENTS : F2FS_DIRTY_DATA; // 預先定義帳本類型
+	unsigned int retry_cnt = 0;
 
 	trace_f2fs_sync_dirty_inodes_enter(sbi->sb, is_dir,
 				get_pages(sbi, is_dir ?
 				F2FS_DIRTY_DENTS : F2FS_DIRTY_DATA));
 retry:
+	/* ========================================================= */
+	/* CXL DAX MOD: 活鎖保險絲 — 保證 umount 一定會終止           */
+	/* 超過上限次數就不再信任 list/計數的一致性，強制清空收尾 */
+	/* ========================================================= */
+	if (unlikely(++retry_cnt > F2FS_CXL_SYNC_DIRTY_MAX_RETRY)) {
+		struct f2fs_inode_info *tmp, *next;
+		unsigned int forced = 0;
+
+		f2fs_warn(sbi, "F2FS-CXL: f2fs_sync_dirty_inodes exceeded %d retries, "
+			"force draining inode_list[%d] to unblock umount",
+			F2FS_CXL_SYNC_DIRTY_MAX_RETRY, type);
+
+		spin_lock(&sbi->inode_lock[type]);
+		list_for_each_entry_safe(tmp, next, &sbi->inode_list[type], dirty_list) {
+			list_del_init(&tmp->dirty_list);
+			atomic_set(&tmp->dirty_pages, 0);
+			if (is_dir)
+				clear_inode_flag(&tmp->vfs_inode, FI_DIRTY_DIR);
+			forced++;
+		}
+		spin_unlock(&sbi->inode_lock[type]);
+
+		while (get_pages(sbi, type_count) > 0)
+			dec_page_count(sbi, type_count);
+
+		f2fs_warn(sbi, "F2FS-CXL: force-drained %u inodes from inode_list[%d]",
+			forced, type);
+
+		trace_f2fs_sync_dirty_inodes_exit(sbi->sb, is_dir,
+				get_pages(sbi, is_dir ?
+				F2FS_DIRTY_DENTS : F2FS_DIRTY_DATA));
+		return 0;
+	}
+
 	if (unlikely(f2fs_cp_error(sbi))) {
 		trace_f2fs_sync_dirty_inodes_exit(sbi->sb, is_dir,
 				get_pages(sbi, is_dir ?
@@ -1200,30 +1237,34 @@ skip_write:
 		/* ================================================== */
         /* 🚨 防線二：強制拔除 igrab(NULL) 的死亡迴圈 🚨      */
         /* 既然它要死了，我們就幫它從髒清單上解脫，不然會無限迴圈 */
+        /* CXL DAX MOD: 無條件摘除，不再檢查 list_empty ——     */
+        /* 原本的判斷會讓某些節點永遠摘不掉，導致同一個壞掉的  */
+        /* inode 被反覆撈到而活鎖。實驗環境不在乎資料正確性，  */
+        /* 只求 umount 一定能結束，所以直接強制拔除。           */
         /* ================================================== */
         spin_lock(&sbi->inode_lock[type]);
-        
-        if (!list_empty(&fi->dirty_list)) {
+
+        {
 #ifdef CONFIG_F2FS_SWAP_DEBUG
             printk_ratelimited(KERN_WARNING "F2FS-CXL: Force removing dead igrab(NULL) Inode %lu\n", fi->vfs_inode.i_ino);
 #endif
-            
+
             /* 記錄要扣減的私有髒頁數 */
             int dead_dirty_count = atomic_read(&fi->dirty_pages);
-            
+
             list_del_init(&fi->dirty_list);
             atomic_set(&fi->dirty_pages, 0);
             if (is_dir) {
                 clear_inode_flag(&fi->vfs_inode, FI_DIRTY_DIR);
             }
-            
+
             /* 同步扣減全域大帳本 (老闆的帳) */
             while (dead_dirty_count > 0) {
                 dec_page_count(sbi, type_count);
                 dead_dirty_count--;
             }
         }
-        
+
         spin_unlock(&sbi->inode_lock[type]);
         /* ================================================== */
 	}

@@ -714,7 +714,6 @@ struct f2fs_map_blocks {
 	struct block_device *m_bdev;	/* for multi-device dio */
 	block_t m_pblk;
 	block_t m_lblk;
-	block_t m_node_blkaddr;
 	nid_t m_nid;
 	unsigned int m_node_ofs;
 	unsigned int m_len;
@@ -1571,12 +1570,12 @@ struct f2fs_za_bio_ctx {
 	struct inode *inode;
 	pgoff_t logical_page_idx;
 	block_t prealloc_blkaddr;
-	block_t node_blkaddr;
 	nid_t nid;
 	unsigned int node_ofs;
 	block_t dev_start_blk;
 	block_t actual_blkaddr;
 	struct work_struct work;
+	struct page *node_page;
 };
 
 struct f2fs_sb_info {
@@ -3774,9 +3773,9 @@ void f2fs_replace_block(struct f2fs_sb_info *sbi, struct dnode_of_data *dn,
 void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 			block_t old_blkaddr, block_t *new_blkaddr,
 			struct f2fs_summary *sum, int type,
-			struct f2fs_io_info *fio);
-void f2fs_update_sit_for_zns_swap(struct f2fs_sb_info *sbi, block_t prealloc_blkaddr,
-		block_t actual_blkaddr, int nr_blocks);
+			struct f2fs_io_info *fio, bool defer_sit);
+void f2fs_zns_swap_commit_block(struct f2fs_sb_info *sbi, block_t old_blkaddr,
+		block_t new_blkaddr);
 void f2fs_update_device_state(struct f2fs_sb_info *sbi, nid_t ino,
 					block_t blkaddr, unsigned int blkcnt);
 void f2fs_wait_on_page_writeback(struct page *page,

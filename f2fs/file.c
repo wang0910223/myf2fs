@@ -4645,9 +4645,60 @@ static void f2fs_swap_zone_append_work(struct work_struct *work)
 	struct inode *inode = ctx->inode;
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	int nr_blocks = ctx->orig_bio->bi_iter.bi_size >> sbi->log_blocksize;
+	int i;
 
-	f2fs_update_sit_for_zns_swap(sbi, ctx->prealloc_blkaddr, ctx->actual_blkaddr, nr_blocks);
+	/*
+	 * Commit the true block address(es) for this write.
+	 *
+	 * The node page is the single source of truth for "what is the
+	 * current physical block for this slot": nothing writes to it
+	 * speculatively at allocation time for this path anymore (see the
+	 * defer_sit parameter of f2fs_allocate_data_block()), only
+	 * completion handlers like this one, always under the page lock.
+	 * So whatever we read here, right before overwriting it, is
+	 * guaranteed to be the correct address to invalidate -- regardless
+	 * of how many other writes to this exact slot raced ahead of or
+	 * behind this one. This is what makes the bitmap update below
+	 * correct without needing to serialize submission of concurrent
+	 * writes to the same slot.
+	 */
+	if (ctx->node_page) {
+		struct f2fs_node *k_rn;
+		__le32 *k_addr_array;
 
+		lock_page(ctx->node_page);
+		k_rn = F2FS_NODE(ctx->node_page);
+		k_addr_array = blkaddr_in_node(k_rn);
+
+		for (i = 0; i < nr_blocks; i++) {
+			block_t old_blkaddr =
+				le32_to_cpu(k_addr_array[ctx->node_ofs + i]);
+			block_t new_blkaddr = ctx->actual_blkaddr + i;
+
+			k_addr_array[ctx->node_ofs + i] = cpu_to_le32(new_blkaddr);
+			f2fs_zns_swap_commit_block(sbi, old_blkaddr, new_blkaddr);
+		}
+
+		set_page_dirty(ctx->node_page);
+		unlock_page(ctx->node_page);
+		put_page(ctx->node_page); /* release the reference taken at submit_io */
+	} else {
+		/*
+		 * Should not happen now that submit_io pins the node page via
+		 * f2fs_get_node_page(), but if it ever does we have no way to
+		 * learn the slot's previous address. Mark the newly-written
+		 * block(s) valid so live data is never mistaken for free
+		 * space, at the cost of leaking whatever the slot previously
+		 * pointed at -- safer than risking a bitmap double-clear.
+		 */
+		f2fs_err(sbi, "[ZNS] Node page for nid %u missing at completion! "
+			 "Leaking previous block(s) for this slot.", ctx->nid);
+		for (i = 0; i < nr_blocks; i++)
+			f2fs_zns_swap_commit_block(sbi, NULL_ADDR,
+						    ctx->actual_blkaddr + i);
+	}
+
+	/* Unlock swap slot (complete the original BIO) */
 	ctx->orig_bio->bi_end_io = ctx->orig_bi_end_io;
 	ctx->orig_bio->bi_private = ctx->orig_bi_private;
 	if (ctx->orig_bio->bi_end_io)
@@ -4663,7 +4714,6 @@ static void f2fs_swap_zone_append_end_io(struct bio *bio)
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	/* actual_blkaddr here is the GLOBAL block address */
 	block_t actual_blkaddr = (bio->bi_iter.bi_sector >> (sbi->log_blocksize - SECTOR_SHIFT)) + ctx->dev_start_blk;
-	struct f2fs_node *rn;
 	struct f2fs_summary_block *sum_blk;
 	unsigned long flags;
 	unsigned int segno;
@@ -4680,49 +4730,34 @@ static void f2fs_swap_zone_append_end_io(struct bio *bio)
 			   ctx->prealloc_blkaddr, actual_blkaddr, (unsigned long long)bio->bi_iter.bi_sector);
 #endif
 
-	if (actual_blkaddr != ctx->prealloc_blkaddr && sbi->is_cxl_dax) {
-		spin_lock_irqsave(&sbi->cxl_meta_lock, flags);
-
-		/* 1. Update Node Page */
-		if (ctx->node_blkaddr != 0) {
-			rn = (struct f2fs_node *)((char *)sbi->cxl_base_addr +
-				(ctx->node_blkaddr << sbi->log_blocksize));
-			
-			for (i = 0; i < nr_blocks; i++) {
-				__le32 *addr_array = blkaddr_in_node(rn);
-				addr_array[ctx->node_ofs + i] = cpu_to_le32(actual_blkaddr + i);
-			}
-		}
-
-		for (i = 0; i < nr_blocks; i++) {
-			/* 
-			 * [ZNS CXL Swapfile FIX Phase 2]
-			 * F2FS __allocate_data_block dirties the Linux Page Cache Node Page with a PREDICTED block address.
-			 * When Checkpoint runs, it flushes this dirty page, OVERWRITING our true actual_blkaddr in CXL!
-			 * We MUST sync the true actual_blkaddr back to the Page Cache to prevent this corruption!
+	if (sbi->is_cxl_dax) {
+		if (actual_blkaddr != ctx->prealloc_blkaddr) {
+			/*
+			 * ZONE_APPEND landed away from the predicted slot, so
+			 * the SSA (reverse map) entry f2fs_allocate_data_block()
+			 * wrote at the *predicted* position doesn't describe
+			 * what's really here. Fix it up at the real position.
 			 */
-			{
-				struct page *node_page = find_get_page(NODE_MAPPING(sbi), ctx->nid);
-				if (node_page) {
-					struct f2fs_node *k_rn = F2FS_NODE(node_page);
-					__le32 *k_addr_array = blkaddr_in_node(k_rn);
-					k_addr_array[ctx->node_ofs + i] = cpu_to_le32(actual_blkaddr + i);
-					set_page_dirty(node_page);
-					put_page(node_page);
-				}
+			spin_lock_irqsave(&sbi->cxl_meta_lock, flags);
+			for (i = 0; i < nr_blocks; i++) {
+				segno = GET_SEGNO(sbi, actual_blkaddr + i);
+				sum_blk = (struct f2fs_summary_block *)((char *)sbi->cxl_base_addr +
+					(GET_SUM_BLOCK(sbi, segno) << sbi->log_blocksize));
+				sum_blk->entries[GET_BLKOFF_FROM_SEG0(sbi, actual_blkaddr + i)].nid = cpu_to_le32(ctx->nid);
+				sum_blk->entries[GET_BLKOFF_FROM_SEG0(sbi, actual_blkaddr + i)].ofs_in_node = cpu_to_le16(ctx->node_ofs + i);
 			}
-
-			/* 2. Update SSA (Reverse map) */
-			segno = GET_SEGNO(sbi, actual_blkaddr + i);
-			sum_blk = (struct f2fs_summary_block *)((char *)sbi->cxl_base_addr +
-				(GET_SUM_BLOCK(sbi, segno) << sbi->log_blocksize));
-			sum_blk->entries[GET_BLKOFF_FROM_SEG0(sbi, actual_blkaddr + i)].nid = cpu_to_le32(ctx->nid);
-			sum_blk->entries[GET_BLKOFF_FROM_SEG0(sbi, actual_blkaddr + i)].ofs_in_node = cpu_to_le16(ctx->node_ofs + i);
+			spin_unlock_irqrestore(&sbi->cxl_meta_lock, flags);
 		}
 
-		spin_unlock_irqrestore(&sbi->cxl_meta_lock, flags);
-
-		/* Defer SIT update and BIO completion to a workqueue */
+		/*
+		 * The node page write and SIT commit always need to happen
+		 * here now, not just on a prealloc/actual mismatch:
+		 * f2fs_allocate_data_block() deliberately left both alone at
+		 * allocation time for this path (its defer_sit parameter).
+		 * Do it in a workqueue since lock_page() and the SIT
+		 * sentry_lock may sleep, which this bio completion context
+		 * does not allow.
+		 */
 		ctx->actual_blkaddr = actual_blkaddr;
 		INIT_WORK(&ctx->work, f2fs_swap_zone_append_work);
 		queue_work(system_unbound_wq, &ctx->work);
@@ -4771,18 +4806,28 @@ static void f2fs_swap_zone_append_submit_io(const struct iomap_iter *iter,
 	node_info = (u64)iter->iomap.private;
 	ctx->nid = (nid_t)(node_info >> 16);
 	ctx->node_ofs = (unsigned int)(node_info & 0xFFFF);
-	
-	/* Call f2fs_get_node_info to get the real physical block address of the node page */
-	{
-		struct node_info ni;
-		if (!f2fs_get_node_info(sbi, ctx->nid, &ni, false))
-			ctx->node_blkaddr = ni.blk_addr;
-		else
-			ctx->node_blkaddr = 0; /* Fallback if failed */
-	}
 
 	bio->bi_private = ctx;
 	bio->bi_end_io = f2fs_swap_zone_append_end_io;
+
+	/*
+	 * Pin the node page in memory BEFORE submitting the BIO, and hold
+	 * that reference until the completion workqueue is done with it.
+	 * f2fs_allocate_data_block() no longer dirties this slot's node
+	 * page at allocation time for ZNS swap writes (that's now deferred
+	 * to completion, see defer_sit), so it can't be assumed resident;
+	 * use f2fs_get_node_page() rather than a plain cache lookup so it
+	 * gets read back in if it was reclaimed.
+	 */
+	ctx->node_page = f2fs_get_node_page(sbi, ctx->nid);
+	if (IS_ERR(ctx->node_page)) {
+		f2fs_err(sbi, "[ZNS] Failed to get node page for nid %u at submit: %ld",
+			 ctx->nid, PTR_ERR(ctx->node_page));
+		ctx->node_page = NULL;
+	} else {
+		/* Keep the reference; only need the lock again at completion. */
+		unlock_page(ctx->node_page);
+	}
 
 	/* 
 	 * NVMe ZNS ZONE_APPEND MUST have bi_sector aligned to the start of the zone.

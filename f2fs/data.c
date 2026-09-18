@@ -1612,6 +1612,7 @@ static int __allocate_data_block(struct dnode_of_data *dn, int seg_type)
 	struct node_info ni;
 	block_t old_blkaddr;
 	blkcnt_t count = 1;
+	bool defer_sit;
 	int err;
 
 	if (unlikely(is_inode_flag_set(dn->inode, FI_NO_ALLOC)))
@@ -1628,10 +1629,29 @@ static int __allocate_data_block(struct dnode_of_data *dn, int seg_type)
 			return err;
 	}
 
+	/*
+	 * ZNS swap writes land via ZONE_APPEND (f2fs_swap_zone_append_*),
+	 * which may complete at a different physical block than the one
+	 * reserved below. Don't touch the SIT bitmap or write this slot's
+	 * node-page block pointer here in that case -- defer both to
+	 * completion time (f2fs_zns_swap_commit_block()), which reads the
+	 * slot's *current* address under the node page lock right before
+	 * overwriting it. That's the only way to invalidate the correct old
+	 * address when the same slot gets rewritten again before this
+	 * write's own completion has run.
+	 */
+	defer_sit = sbi->is_cxl_dax && f2fs_sb_has_blkzoned(sbi) &&
+			f2fs_lfs_mode(sbi) && IS_SWAPFILE(dn->inode);
+
 	set_summary(&sum, dn->nid, dn->ofs_in_node, ni.version);
 	old_blkaddr = dn->data_blkaddr;
-	f2fs_allocate_data_block(sbi, NULL, old_blkaddr, &dn->data_blkaddr,
-				&sum, seg_type, NULL);
+	f2fs_allocate_data_block(sbi, NULL, defer_sit ? NULL_ADDR : old_blkaddr,
+				&dn->data_blkaddr, &sum, seg_type, NULL,
+				defer_sit);
+
+	if (defer_sit)
+		return 0;
+
 	if (GET_SEGNO(sbi, old_blkaddr) != NULL_SEGNO)
 		f2fs_invalidate_internal_cache(sbi, old_blkaddr);
 
@@ -1886,12 +1906,8 @@ next_block:
 		map->m_len = 1;
 
 		if (f2fs_sb_has_blkzoned(sbi) && IS_SWAPFILE(inode)) {
-			struct node_info ni;
-			if (!f2fs_get_node_info(sbi, dn.nid, &ni, false)) {
-				map->m_node_blkaddr = ni.blk_addr;
-				map->m_nid = dn.nid;
-				map->m_node_ofs = dn.ofs_in_node;
-			}
+			map->m_nid = dn.nid;
+			map->m_node_ofs = dn.ofs_in_node;
 		}
 
 
