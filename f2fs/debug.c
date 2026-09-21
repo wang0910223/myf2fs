@@ -661,117 +661,6 @@ static int stat_show(struct seq_file *s, void *v)
 
 DEFINE_SHOW_ATTRIBUTE(stat);
 
-/*
- * Dumps the live contents of every CURSEG_COLD_DATA curseg's zns_track[]
- * table (see struct f2fs_zns_zone_track in segment.h): which physical zones
- * are currently believed to still have ZNS swap ZONE_APPEND writes in
- * flight, how many, and whether new_curseg() has already abandoned them.
- * Meant for diagnosing zones that stay open (never reach ZONE_FINISH) far
- * longer than any real in-flight I/O could explain -- i.e. a leaked
- * in-flight count -- without needing to reproduce from a fresh mkfs.
- */
-static int zns_track_show(struct seq_file *s, void *v)
-{
-	struct f2fs_stat_info *si;
-	unsigned long flags;
-	int fs_idx = 0;
-
-	raw_spin_lock_irqsave(&f2fs_stat_lock, flags);
-	list_for_each_entry(si, &f2fs_stat_list, stat_list) {
-		struct f2fs_sb_info *sbi = si->sbi;
-		struct curseg_info *curseg;
-		unsigned long tflags;
-		int i;
-
-		if (!f2fs_sb_has_blkzoned(sbi)) {
-			seq_printf(s, "\n=====[ partition info(%pg). #%d ]=====\n"
-				   "not a zoned filesystem\n",
-				   sbi->sb->s_bdev, fs_idx++);
-			continue;
-		}
-
-		curseg = CURSEG_I(sbi, CURSEG_COLD_DATA);
-		seq_printf(s, "\n=====[ partition info(%pg). #%d ]=====\n"
-			   "CURSEG_COLD_DATA: segno=%u zone=%u\n",
-			   sbi->sb->s_bdev, fs_idx++, curseg->segno,
-			   curseg->zone);
-
-		spin_lock_irqsave(&curseg->zns_track_lock, tflags);
-		for (i = 0; i < F2FS_ZNS_TRACK_SLOTS; i++) {
-			struct f2fs_zns_zone_track *t = &curseg->zns_track[i];
-
-			if (t->zoneno == NULL_SEGNO)
-				continue;
-			seq_printf(s,
-				"  slot[%d]: zoneno=%u blkaddr=%u inflight=%d abandoned=%d "
-				"alloc_calls=%u complete_calls=%u complete_blocks=%u "
-				"(alloc-complete_blocks=%d) alloc_calls_no_ctx=%u\n",
-				i, t->zoneno, t->blkaddr,
-				atomic_read(&t->inflight), t->abandoned,
-				t->alloc_calls, t->complete_calls, t->complete_blocks,
-				(int)(t->alloc_calls - t->complete_blocks),
-				t->alloc_calls_no_ctx);
-
-			/*
-			 * DIAGNOSTIC: list every block offset within this
-			 * zone that was allocated but never marked completed
-			 * -- these are the exact blocks whose completion
-			 * never arrived, no matter how long ago they were
-			 * allocated (unlike the ring buffer this replaced).
-			 * Remove once the root cause is confirmed.
-			 */
-			if (t->pending_bitmap &&
-					t->pending_bitmap_zoneno == t->zoneno) {
-				unsigned int off = 0, shown = 0, total = 0;
-				unsigned int never_submitted = 0;
-
-				for_each_set_bit(off, t->pending_bitmap,
-						t->pending_bitmap_bits) {
-					/*
-					 * DIAGNOSTIC: was this offset ever
-					 * handed to submit_bio()? If not, the
-					 * leak is upstream of the bio (in
-					 * f2fs_map_blocks()/iomap deciding not
-					 * to send it at all); if so, the bio
-					 * was submitted but its completion
-					 * never arrived. Tells the two failure
-					 * points apart.
-					 */
-					bool was_submitted = t->submitted_bitmap &&
-						test_bit(off, t->submitted_bitmap);
-
-					total++;
-					if (!was_submitted)
-						never_submitted++;
-					if (shown < 20) {
-						/*
-						 * off is the block offset within
-						 * this zone (blkaddr %
-						 * blocks_per_blkz at alloc time);
-						 * t->blkaddr is some other block
-						 * in the same zone, included only
-						 * to help locate it (NOT a base
-						 * to add off to).
-						 */
-						seq_printf(s,
-							"    pending block offset %u (some other blkaddr in same zone: %u) submitted=%d\n",
-							off, t->blkaddr, was_submitted);
-						shown++;
-					}
-				}
-				seq_printf(s,
-					"    (%u pending block(s) total, %u never submitted, in this zone%s)\n",
-					total, never_submitted,
-					total > shown ? ", truncated" : "");
-			}
-		}
-		spin_unlock_irqrestore(&curseg->zns_track_lock, tflags);
-	}
-	raw_spin_unlock_irqrestore(&f2fs_stat_lock, flags);
-	return 0;
-}
-
-DEFINE_SHOW_ATTRIBUTE(zns_track);
 #endif
 
 int f2fs_build_stats(struct f2fs_sb_info *sbi)
@@ -847,8 +736,6 @@ void __init f2fs_create_root_stats(void)
 
 	debugfs_create_file("status", 0444, f2fs_debugfs_root, NULL,
 			    &stat_fops);
-	debugfs_create_file("zns_track", 0444, f2fs_debugfs_root, NULL,
-			    &zns_track_fops);
 #endif
 }
 

@@ -340,61 +340,6 @@ struct f2fs_zns_zone_track {
 	atomic_t inflight;		/* # of allocated-but-not-yet-completed
 					 * writes targeting zoneno */
 	bool abandoned;			/* new_curseg() has moved off zoneno */
-	/*
-	 * DIAGNOSTIC: absolute lifetime counters, never reset while this
-	 * slot is in use for a given zoneno (unlike inflight, which is a
-	 * running difference). If alloc_calls - complete_calls != inflight
-	 * ever holds when it shouldn't, or complete_calls stops advancing
-	 * while inflight stays stuck positive, that pinpoints whether the
-	 * leak is on the alloc side (over-counting) or the complete side
-	 * (a completion path silently not being reached) -- unlike
-	 * inflight's bare difference, which cannot distinguish the two.
-	 * Remove once the root cause is confirmed.
-	 */
-	unsigned int alloc_calls;
-	unsigned int complete_calls;
-	unsigned int complete_blocks;	/* sum of nr_blocks across complete_calls */
-	/*
-	 * DIAGNOSTIC: how many of alloc_calls happened with no
-	 * f2fs_zns_swap_alloc_ctx active on current->journal_info -- i.e.
-	 * NOT from inside f2fs_swap_rw()'s __iomap_dio_rw()/iomap_dio_complete()
-	 * call chain, so f2fs_zns_swap_track_alloc_ctx_end()'s reconciliation
-	 * can never see or roll back these allocations no matter what
-	 * iomap_dio_complete() reports. If this is nonzero for a zone stuck
-	 * with a positive inflight, that pinpoints the leak to whatever
-	 * other call path is reaching f2fs_allocate_data_block() with
-	 * defer_sit set. Remove once the root cause is confirmed.
-	 */
-	unsigned int alloc_calls_no_ctx;
-	/*
-	 * DIAGNOSTIC: one bit per block offset within this zone (indexed by
-	 * blkaddr % blocks_per_blkz), set by track_alloc() and cleared by
-	 * track_complete(). Unlike the ring buffer this replaces, nothing
-	 * ever overwrites an entry here, so any bit still set once this
-	 * zone's alloc_calls stops advancing (i.e. after the test run ends)
-	 * is the exact block offset whose completion never arrived -- no
-	 * matter how long ago it was allocated. Allocated lazily per slot
-	 * (sized off sbi->blocks_per_blkz) since it's diagnostic-only.
-	 * Remove once the root cause is confirmed.
-	 */
-	unsigned long *pending_bitmap;
-	unsigned int pending_bitmap_bits;	/* size pending_bitmap was allocated for */
-	unsigned int pending_bitmap_zoneno;	/* which zoneno pending_bitmap's bits
-						 * are currently valid for, so a
-						 * slot reused for a different zone
-						 * knows to clear it. NULL_SEGNO if
-						 * never populated. */
-	/*
-	 * DIAGNOSTIC: same idea as pending_bitmap, but set by
-	 * f2fs_swap_zone_append_submit_io() (bio actually handed to
-	 * submit_bio()) instead of track_alloc(), and never cleared. Any
-	 * block offset that's set in pending_bitmap but NOT set here was
-	 * allocated but never even got as far as being submitted in a bio --
-	 * as opposed to being submitted but never completed. Distinguishes
-	 * those two failure points. Shares pending_bitmap's sizing/reuse
-	 * bookkeeping (pending_bitmap_bits/pending_bitmap_zoneno).
-	 */
-	unsigned long *submitted_bitmap;
 };
 
 struct curseg_info {

@@ -4493,25 +4493,12 @@ static int f2fs_swap_rw(struct kiocb *iocb, struct iov_iter *iter)
 
 		if (f2fs_sb_has_blkzoned(sbi)) {
 			struct iomap_dio *dio;
-			struct f2fs_zns_swap_alloc_ctx alloc_ctx;
 
 			/* Defensive programming: check for checkpoint error */
 			if (unlikely(f2fs_cp_error(sbi))) {
 				ret = -EIO;
 				goto out;
 			}
-
-			/*
-			 * Track how many blocks f2fs_zns_swap_track_alloc()
-			 * counts as in-flight during this write(), so any
-			 * trailing gap between that and what iomap actually
-			 * submits (e.g. bio_iov_iter_get_pages() failing
-			 * partway through under memory pressure) can be
-			 * rolled back below instead of leaking those zones'
-			 * in-flight counts forever. See struct
-			 * f2fs_zns_swap_alloc_ctx.
-			 */
-			f2fs_zns_swap_track_alloc_ctx_begin(&alloc_ctx);
 
 			/* 
 			 * BYPASS f2fs_file_write_iter() and inode_lock() entirely!
@@ -4526,22 +4513,6 @@ static int f2fs_swap_rw(struct kiocb *iocb, struct iov_iter *iter)
 				ret = PTR_ERR_OR_ZERO(dio);
 			else
 				ret = iomap_dio_complete(dio);
-
-			/*
-			 * ret == -EIOCBQUEUED means this write's completion is
-			 * still pending elsewhere (async DIO) -- we don't yet
-			 * know its final byte count, so reconciling now would
-			 * misfire. This path bypasses f2fs_file_write_iter()
-			 * and is always driven with a synchronous kiocb (see
-			 * comment above), so this should not happen in
-			 * practice, but skip reconciliation rather than risk
-			 * an incorrect rollback if it ever does.
-			 */
-			if (ret != -EIOCBQUEUED)
-				f2fs_zns_swap_track_alloc_ctx_end(sbi,
-						&alloc_ctx, ret);
-			else
-				current->journal_info = NULL;
 		} else {
 			ret = f2fs_file_write_iter(iocb, iter);
 		}

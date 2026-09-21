@@ -31,7 +31,15 @@ myf2fs-$(CONFIG_F2FS_FS_COMPRESSION) += compress.o
 myf2fs-$(CONFIG_F2FS_IOSTAT) += iostat.o
 
 # ===================================================================
-# 4. Out-of-Tree 專用編譯指令區塊
+# 4. ZNS swap 除錯輸出開關
+# ===================================================================
+# 取消下一行的註解即可開啟 ZNS swapfile 路徑的詳細除錯輸出
+# （zone abandon/drain/finish 追蹤、iomap_begin 與 end_io 的位址資訊等）。
+# 平時保持關閉，避免在寫入熱路徑上產生大量 dmesg 輸出。
+# ccflags-y += -DCONFIG_F2FS_SWAP_DEBUG
+
+# ===================================================================
+# 5. Out-of-Tree 專用編譯指令區塊
 # ===================================================================
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)

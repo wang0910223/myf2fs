@@ -4644,11 +4644,7 @@ static void f2fs_swap_zone_append_work(struct work_struct *work)
 	struct f2fs_za_bio_ctx *ctx = container_of(work, struct f2fs_za_bio_ctx, work);
 	struct inode *inode = ctx->inode;
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
-	/*
-	 * NOT ctx->orig_bio->bi_iter.bi_size -- the block layer has already
-	 * advanced that to 0 by completion time. See the comment on struct
-	 * f2fs_za_bio_ctx's nr_blocks field.
-	 */
+	/* Not recomputed from bi_iter; see f2fs_za_bio_ctx's nr_blocks. */
 	int nr_blocks = ctx->nr_blocks;
 	int i;
 
@@ -4733,12 +4729,7 @@ static void f2fs_swap_zone_append_end_io(struct bio *bio)
 	struct f2fs_summary_block *sum_blk;
 	unsigned long flags;
 	unsigned int segno;
-	/*
-	 * NOT bio->bi_iter.bi_size -- the block layer has already advanced
-	 * that to 0 by the time ->bi_end_io (this function) runs, for both
-	 * the success and failure cases (see req_bio_endio() in blk-mq.c).
-	 * See the comment on struct f2fs_za_bio_ctx's nr_blocks field.
-	 */
+	/* Not recomputed from bi_iter; see f2fs_za_bio_ctx's nr_blocks. */
 	int nr_blocks = ctx->nr_blocks;
 	int i;
 
@@ -4831,15 +4822,11 @@ static void f2fs_swap_zone_append_submit_io(const struct iomap_iter *iter,
 	ctx->dev_start_blk = dev_start_blk;
 
 	/*
-	 * Capture this now, while bio->bi_iter.bi_size is still the bio's
-	 * real size -- by completion time it will have been advanced to 0.
-	 * See the comment on struct f2fs_za_bio_ctx's nr_blocks field.
+	 * Capture the size now, before submit_bio(); see the nr_blocks field
+	 * of struct f2fs_za_bio_ctx for why it must not be recomputed at
+	 * completion time.
 	 */
 	ctx->nr_blocks = bio->bi_iter.bi_size >> sbi->log_blocksize;
-
-	/* DIAGNOSTIC: see struct f2fs_zns_zone_track's submitted_bitmap. */
-	f2fs_zns_swap_track_submitted(sbi, CURSEG_COLD_DATA,
-			ctx->prealloc_blkaddr, ctx->nr_blocks);
 
 	node_info = (u64)iter->iomap.private;
 	ctx->nid = (nid_t)(node_info >> 16);

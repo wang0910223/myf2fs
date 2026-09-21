@@ -2966,8 +2966,10 @@ static void f2fs_zns_swap_finish_zone_work(struct work_struct *work)
 	struct f2fs_zns_finish_work *fw =
 		container_of(work, struct f2fs_zns_finish_work, work);
 
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 	printk_ratelimited(KERN_ERR "F2FS-ZNS: finishing zone for blkaddr %u\n",
 			   fw->blkaddr);
+#endif
 	f2fs_zns_swap_finish_zone(fw->sbi, fw->blkaddr);
 	kfree(fw);
 }
@@ -3052,91 +3054,10 @@ static struct f2fs_zns_zone_track *zns_track_find_or_add(
 			t->zoneno = zoneno;
 			atomic_set(&t->inflight, 0);
 			t->abandoned = false;
-			t->alloc_calls = 0;
-			t->complete_calls = 0;
-			t->complete_blocks = 0;
-			t->alloc_calls_no_ctx = 0;
-			/*
-			 * DIAGNOSTIC: this slot's pending_bitmap/submitted_bitmap
-			 * (if any -- lazily allocated by
-			 * f2fs_zns_swap_track_alloc()/_submitted()) belonged to
-			 * whatever zone previously occupied this slot; free them
-			 * so they get freshly (re)allocated, sized for the
-			 * current sbi->blocks_per_blkz, for this zoneno.
-			 */
-			kfree(t->pending_bitmap);
-			t->pending_bitmap = NULL;
-			kfree(t->submitted_bitmap);
-			t->submitted_bitmap = NULL;
-			t->pending_bitmap_zoneno = NULL_SEGNO;
 			return t;
 		}
 	}
 	return NULL;
-}
-
-#define F2FS_ZNS_SWAP_ALLOC_CTX_MAGIC 0xf2f5a110
-
-/*
- * Start tracking, for the duration of a single f2fs_swap_rw() write() call,
- * how many blocks f2fs_zns_swap_track_alloc() actually counts as in-flight.
- * See struct f2fs_zns_swap_alloc_ctx in f2fs.h for why this is needed.
- *
- * current->journal_info is not used by f2fs otherwise; nothing in the
- * f2fs_swap_rw() call chain (iomap, block layer, etc.) touches it either, and
- * the whole chain runs synchronously on this same task, so it is safe to use
- * as a way to thread this context through call sites (f2fs_iomap_begin(),
- * __allocate_data_block()) whose signatures f2fs does not control.
- */
-void f2fs_zns_swap_track_alloc_ctx_begin(struct f2fs_zns_swap_alloc_ctx *ctx)
-{
-	ctx->magic = F2FS_ZNS_SWAP_ALLOC_CTX_MAGIC;
-	ctx->count = 0;
-	ctx->last_blkaddr = NULL_ADDR;
-	current->journal_info = ctx;
-}
-
-/*
- * Reconcile the tracked count against how many blocks this write() actually
- * got as far as submitting (bytes_written, as returned by iomap_dio_complete()
- * -- negative or short on error/partial completion). Any gap between what was
- * tracked and what was actually written is the trailing tail of the extent
- * that iomap gave up on after it was already allocated (and thus already
- * counted in-flight) -- see the comment on struct f2fs_zns_swap_alloc_ctx.
- * Roll each of those back one block at a time (rare path, so simplicity over
- * batching) so their zones' in-flight counts don't leak forever.
- */
-void f2fs_zns_swap_track_alloc_ctx_end(struct f2fs_sb_info *sbi,
-		struct f2fs_zns_swap_alloc_ctx *ctx, loff_t bytes_written)
-{
-	unsigned int blocks_written = 0;
-	unsigned int gap;
-	block_t blkaddr;
-
-	current->journal_info = NULL;
-
-	if (bytes_written > 0)
-		blocks_written = bytes_written >> sbi->log_blocksize;
-
-	if (ctx->count <= blocks_written)
-		return;
-
-	gap = ctx->count - blocks_written;
-	f2fs_err(sbi, "[ZNS] write() tracked %u blocks but only %u were "
-		 "actually submitted; rolling back %u leaked in-flight "
-		 "count(s) ending at blkaddr %u",
-		 ctx->count, blocks_written, gap, ctx->last_blkaddr);
-
-	/*
-	 * track_alloc() calls happen in ascending blkaddr order within a
-	 * single write(), so the untransmitted tail is the last `gap` blocks
-	 * up to and including last_blkaddr. Roll back one at a time (rather
-	 * than as a single ranged call) since the range could in principle
-	 * straddle a zone boundary.
-	 */
-	blkaddr = ctx->last_blkaddr - gap + 1;
-	for (; gap > 0; gap--, blkaddr++)
-		f2fs_zns_swap_track_complete(sbi, CURSEG_COLD_DATA, blkaddr, 1);
 }
 
 /*
@@ -3152,13 +3073,6 @@ void f2fs_zns_swap_track_alloc(struct f2fs_sb_info *sbi, int type,
 	unsigned int zoneno = f2fs_zns_phys_zoneno(sbi, blkaddr);
 	struct f2fs_zns_zone_track *t;
 	unsigned long flags;
-	struct f2fs_zns_swap_alloc_ctx *ctx = current->journal_info;
-	bool has_ctx = ctx && ctx->magic == F2FS_ZNS_SWAP_ALLOC_CTX_MAGIC;
-
-	if (has_ctx) {
-		ctx->count++;
-		ctx->last_blkaddr = blkaddr;
-	}
 
 	if (zoneno == NULL_SEGNO)
 		return;
@@ -3168,101 +3082,19 @@ void f2fs_zns_swap_track_alloc(struct f2fs_sb_info *sbi, int type,
 	if (t) {
 		t->blkaddr = blkaddr;
 		atomic_inc(&t->inflight);
-		t->alloc_calls++;
-		if (!has_ctx)
-			t->alloc_calls_no_ctx++;
-
-		/*
-		 * DIAGNOSTIC: see struct f2fs_zns_zone_track's pending_bitmap.
-		 * (Re)allocate it if this slot doesn't have one sized for
-		 * this zoneno yet -- GFP_ATOMIC since we're under a spinlock;
-		 * on allocation failure just skip this diagnostic for this
-		 * zone rather than dropping the lock (which would reopen the
-		 * race with new_curseg() that zns_track_alloc's placement is
-		 * there to avoid) or blocking.
-		 */
-		if (t->pending_bitmap_zoneno != zoneno) {
-			kfree(t->pending_bitmap);
-			t->pending_bitmap = NULL;
-			if (sbi->blocks_per_blkz) {
-				t->pending_bitmap = kcalloc(
-					BITS_TO_LONGS(sbi->blocks_per_blkz),
-					sizeof(unsigned long), GFP_ATOMIC);
-			}
-			if (t->pending_bitmap) {
-				t->pending_bitmap_bits = sbi->blocks_per_blkz;
-				t->pending_bitmap_zoneno = zoneno;
-			} else {
-				t->pending_bitmap_zoneno = NULL_SEGNO;
-			}
-		}
-		if (t->pending_bitmap) {
-			unsigned int off = blkaddr % sbi->blocks_per_blkz;
-
-			if (off < t->pending_bitmap_bits)
-				set_bit(off, t->pending_bitmap);
-		}
 	} else {
 		/*
-		 * DIAGNOSTIC: all F2FS_ZNS_TRACK_SLOTS slots are in use. This
-		 * should no longer happen now that the table is sized to
-		 * exceed any real device's max_active_zones, so if this ever
-		 * fires it means either the table is still too small for
-		 * this device or slots are leaking (not being freed on
-		 * drain). Count in-use slots to tell those apart at a glance.
+		 * The tracking table is sized to exceed any real device's
+		 * max_active_zones, so this should not be reachable: the
+		 * device itself cannot have more zones open at once than we
+		 * have slots for. If it ever fires, this zone's writes go
+		 * untracked and it can never be finished, so it is worth
+		 * reporting even outside of debug builds.
 		 */
-		int used = 0, i;
-
-		for (i = 0; i < F2FS_ZNS_TRACK_SLOTS; i++)
-			if (curseg->zns_track[i].zoneno != NULL_SEGNO)
-				used++;
 		printk_ratelimited(KERN_ERR
-			"F2FS-ZNS: no free slot for zone %u (blkaddr %u); "
-			"%d/%d slots in use, cur_segno=%u cur_zone=%u\n",
-			zoneno, blkaddr, used, F2FS_ZNS_TRACK_SLOTS,
-			curseg->segno, curseg->zone);
-	}
-	spin_unlock_irqrestore(&curseg->zns_track_lock, flags);
-}
-
-/*
- * DIAGNOSTIC: record that @nr_blocks worth of blocks starting at @blkaddr
- * were actually handed to submit_bio() (called from
- * f2fs_swap_zone_append_submit_io(), i.e. once iomap has committed to
- * sending this range as a bio -- unlike track_alloc(), which fires much
- * earlier, before iomap has decided how (or whether) to split the extent
- * into bios). Comparing this against pending_bitmap tells apart "allocated
- * but never even submitted" from "submitted but never completed". Remove
- * once the root cause is confirmed.
- */
-void f2fs_zns_swap_track_submitted(struct f2fs_sb_info *sbi, int type,
-		block_t blkaddr, int nr_blocks)
-{
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
-	unsigned int zoneno = f2fs_zns_phys_zoneno(sbi, blkaddr);
-	struct f2fs_zns_zone_track *t;
-	unsigned long flags;
-	int b;
-
-	if (zoneno == NULL_SEGNO)
-		return;
-
-	spin_lock_irqsave(&curseg->zns_track_lock, flags);
-	t = zns_track_find(curseg, zoneno);
-	if (t && t->pending_bitmap_zoneno == zoneno) {
-		if (!t->submitted_bitmap && t->pending_bitmap_bits) {
-			t->submitted_bitmap = kcalloc(
-				BITS_TO_LONGS(t->pending_bitmap_bits),
-				sizeof(unsigned long), GFP_ATOMIC);
-		}
-		if (t->submitted_bitmap) {
-			for (b = 0; b < nr_blocks; b++) {
-				unsigned int off = (blkaddr + b) % sbi->blocks_per_blkz;
-
-				if (off < t->pending_bitmap_bits)
-					set_bit(off, t->submitted_bitmap);
-			}
-		}
+			"F2FS-ZNS: no free tracking slot for zone %u (blkaddr %u), "
+			"cur_segno=%u cur_zone=%u\n",
+			zoneno, blkaddr, curseg->segno, curseg->zone);
 	}
 	spin_unlock_irqrestore(&curseg->zns_track_lock, flags);
 }
@@ -3280,10 +3112,10 @@ void f2fs_zns_swap_track_submitted(struct f2fs_sb_info *sbi, int type,
  * was the last write still in flight for it, this is what actually
  * triggers the deferred ZONE_FINISH.
  *
- * Also called by f2fs_zns_swap_track_alloc_ctx_end() to roll back blocks
- * that were tracked as in-flight but never actually got submitted as part
- * of a bio (so no real completion for them will ever arrive) -- from the
- * in-flight count's point of view, "this was never really allocated" and
+ * Also called from f2fs_map_blocks() to release a block that was allocated
+ * (and counted here) but then dropped without ever being included in a
+ * mapping, so no bio -- and hence no real completion -- will ever cover it.
+ * From the in-flight count's point of view "this was never really used" and
  * "this completed" are the same operation: undo the +1 from track_alloc().
  */
 void f2fs_zns_swap_track_complete(struct f2fs_sb_info *sbi, int type,
@@ -3304,53 +3136,35 @@ void f2fs_zns_swap_track_complete(struct f2fs_sb_info *sbi, int type,
 	if (t) {
 		int remaining = atomic_sub_return(nr_blocks, &t->inflight);
 
-		t->complete_calls++;
-		t->complete_blocks += nr_blocks;
-
-		/*
-		 * DIAGNOSTIC: see struct f2fs_zns_zone_track's pending_bitmap.
-		 * Only clear bits if this completion's zoneno matches what
-		 * the bitmap currently holds -- if the slot was reused for a
-		 * different zone in between (only possible after this zone
-		 * already hit inflight==0 and was freed, i.e. exactly the
-		 * case this diagnostic doesn't need to see), the bits are for
-		 * an unrelated zone and must not be touched.
-		 */
-		if (t->pending_bitmap && t->pending_bitmap_zoneno == zoneno) {
-			int b;
-
-			for (b = 0; b < nr_blocks; b++) {
-				unsigned int off = (blkaddr + b) % sbi->blocks_per_blkz;
-
-				if (off < t->pending_bitmap_bits)
-					clear_bit(off, t->pending_bitmap);
-			}
-		}
-
 		if (remaining == 0 && t->abandoned) {
 			should_finish = true;
 			finish_blkaddr = t->blkaddr;
 			t->zoneno = NULL_SEGNO;
-		} else if (t->abandoned && (remaining % 1000 == 0 ||
-					remaining < 20)) {
+		} else if (t->abandoned) {
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 			/*
-			 * DIAGNOSTIC: printk_ratelimited() silently drops most
-			 * completions when they arrive in a burst, which made
-			 * an actively-draining zone look stuck in earlier logs.
-			 * Print unconditionally (not rate-limited) but only at
-			 * this fixed stride, so drain progress is still visible
-			 * without flooding the log for zones with 10k+ in-flight
-			 * writes.
+			 * Trace an abandoned zone draining towards its
+			 * ZONE_FINISH. Not rate-limited (which would silently
+			 * drop most of a burst and make an actively-draining
+			 * zone look stuck) but only printed at this fixed
+			 * stride, so it stays readable for zones with tens of
+			 * thousands of writes in flight.
 			 */
-			printk(KERN_ERR
-				"F2FS-ZNS: zone %u draining, %d remaining (abandoned)\n",
-				zoneno, remaining);
+			if (remaining % 1000 == 0 || remaining < 20)
+				printk(KERN_ERR
+					"F2FS-ZNS: zone %u draining, %d remaining (abandoned)\n",
+					zoneno, remaining);
+#endif
 		}
 	} else {
-		/* DIAGNOSTIC: this completion couldn't find its own zone's
-		 * tracking slot at all -- would explain a permanent leak. */
+		/*
+		 * A completion whose zone has no tracking slot: its
+		 * f2fs_zns_swap_track_alloc() either never ran or its slot was
+		 * already recycled, so this release is lost and that zone's
+		 * count can never reach zero. Always worth reporting.
+		 */
 		printk_ratelimited(KERN_ERR
-			"F2FS-ZNS: complete for zone %u (blkaddr %u) found NO "
+			"F2FS-ZNS: complete for zone %u (blkaddr %u) found no "
 			"tracking slot -- alloc/complete key mismatch?\n",
 			zoneno, blkaddr);
 	}
@@ -3384,9 +3198,11 @@ static void f2fs_zns_swap_track_abandon(struct f2fs_sb_info *sbi,
 	t = zns_track_find(curseg, zoneno);
 	if (t) {
 		t->abandoned = true;
+#ifdef CONFIG_F2FS_SWAP_DEBUG
 		printk_ratelimited(KERN_ERR
 			"F2FS-ZNS: abandon zone %u (blkaddr %u), inflight=%d\n",
 			zoneno, blkaddr, atomic_read(&t->inflight));
+#endif
 		if (atomic_read(&t->inflight) == 0) {
 			should_finish = true;
 			finish_blkaddr = t->blkaddr;
@@ -6114,16 +5930,8 @@ static void destroy_curseg(struct f2fs_sb_info *sbi)
 		return;
 	SM_I(sbi)->curseg_array = NULL;
 	for (i = 0; i < NR_CURSEG_TYPE; i++) {
-		int j;
-
 		kfree(array[i].sum_blk);
 		kfree(array[i].journal);
-		/* DIAGNOSTIC: see struct f2fs_zns_zone_track's
-		 * pending_bitmap/submitted_bitmap. */
-		for (j = 0; j < F2FS_ZNS_TRACK_SLOTS; j++) {
-			kfree(array[i].zns_track[j].pending_bitmap);
-			kfree(array[i].zns_track[j].submitted_bitmap);
-		}
 	}
 	kfree(array);
 }
