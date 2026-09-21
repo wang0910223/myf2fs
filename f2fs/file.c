@@ -4644,7 +4644,12 @@ static void f2fs_swap_zone_append_work(struct work_struct *work)
 	struct f2fs_za_bio_ctx *ctx = container_of(work, struct f2fs_za_bio_ctx, work);
 	struct inode *inode = ctx->inode;
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
-	int nr_blocks = ctx->orig_bio->bi_iter.bi_size >> sbi->log_blocksize;
+	/*
+	 * NOT ctx->orig_bio->bi_iter.bi_size -- the block layer has already
+	 * advanced that to 0 by completion time. See the comment on struct
+	 * f2fs_za_bio_ctx's nr_blocks field.
+	 */
+	int nr_blocks = ctx->nr_blocks;
 	int i;
 
 	/*
@@ -4704,6 +4709,17 @@ static void f2fs_swap_zone_append_work(struct work_struct *work)
 	if (ctx->orig_bio->bi_end_io)
 		ctx->orig_bio->bi_end_io(ctx->orig_bio);
 
+	/*
+	 * This write is now fully done (bi_end_io above already woke up
+	 * whoever was waiting on it), so this is the right place -- off any
+	 * write()'s critical path -- to record its completion against the
+	 * zone it was allocated into and, if that zone was abandoned by
+	 * new_curseg() and this was the last write still in flight for it,
+	 * let f2fs_zns_swap_track_complete() queue the deferred ZONE_FINISH.
+	 */
+	f2fs_zns_swap_track_complete(sbi, CURSEG_COLD_DATA,
+				ctx->prealloc_blkaddr, nr_blocks);
+
 	mempool_free(ctx, sbi->za_ctx_pool);
 }
 
@@ -4717,7 +4733,13 @@ static void f2fs_swap_zone_append_end_io(struct bio *bio)
 	struct f2fs_summary_block *sum_blk;
 	unsigned long flags;
 	unsigned int segno;
-	int nr_blocks = bio->bi_iter.bi_size >> sbi->log_blocksize;
+	/*
+	 * NOT bio->bi_iter.bi_size -- the block layer has already advanced
+	 * that to 0 by the time ->bi_end_io (this function) runs, for both
+	 * the success and failure cases (see req_bio_endio() in blk-mq.c).
+	 * See the comment on struct f2fs_za_bio_ctx's nr_blocks field.
+	 */
+	int nr_blocks = ctx->nr_blocks;
 	int i;
 
 	if (bio->bi_status) {
@@ -4767,6 +4789,11 @@ static void f2fs_swap_zone_append_end_io(struct bio *bio)
 out:
 	bio->bi_end_io = ctx->orig_bi_end_io;
 	bio->bi_private = ctx->orig_bi_private;
+	/* Safe from this bio-completion (hardirq/softirq) context; see
+	 * f2fs_zns_swap_track_complete()'s use of spin_lock_irqsave() and
+	 * f2fs_zns_queue_finish_zone()'s use of GFP_ATOMIC. */
+	f2fs_zns_swap_track_complete(sbi, CURSEG_COLD_DATA,
+				ctx->prealloc_blkaddr, nr_blocks);
 	mempool_free(ctx, sbi->za_ctx_pool);
 	if (bio->bi_end_io)
 		bio->bi_end_io(bio);
@@ -4802,7 +4829,18 @@ static void f2fs_swap_zone_append_submit_io(const struct iomap_iter *iter,
 	/* The sector here is device-relative. We need the global block address for tracking */
 	ctx->prealloc_blkaddr = (bio->bi_iter.bi_sector >> (sbi->log_blocksize - SECTOR_SHIFT)) + dev_start_blk;
 	ctx->dev_start_blk = dev_start_blk;
-	
+
+	/*
+	 * Capture this now, while bio->bi_iter.bi_size is still the bio's
+	 * real size -- by completion time it will have been advanced to 0.
+	 * See the comment on struct f2fs_za_bio_ctx's nr_blocks field.
+	 */
+	ctx->nr_blocks = bio->bi_iter.bi_size >> sbi->log_blocksize;
+
+	/* DIAGNOSTIC: see struct f2fs_zns_zone_track's submitted_bitmap. */
+	f2fs_zns_swap_track_submitted(sbi, CURSEG_COLD_DATA,
+			ctx->prealloc_blkaddr, ctx->nr_blocks);
+
 	node_info = (u64)iter->iomap.private;
 	ctx->nid = (nid_t)(node_info >> 16);
 	ctx->node_ofs = (unsigned int)(node_info & 0xFFFF);

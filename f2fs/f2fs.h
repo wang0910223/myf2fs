@@ -1574,6 +1574,22 @@ struct f2fs_za_bio_ctx {
 	unsigned int node_ofs;
 	block_t dev_start_blk;
 	block_t actual_blkaddr;
+	/*
+	 * Number of blocks this bio covers, captured at submit_io() time
+	 * (before submit_bio()) while bio->bi_iter.bi_size is still the
+	 * bio's real size. By completion time -- whether in
+	 * f2fs_swap_zone_append_end_io() or the work it may queue -- the
+	 * block layer has already advanced bio->bi_iter all the way to 0
+	 * (see req_bio_endio() in blk-mq.c: for REQ_OP_ZONE_APPEND it forces
+	 * nbytes == bi_size before bio_advance(), specifically so bi_size
+	 * hits 0 and bio_endio() -- which is what calls this bio's
+	 * ->bi_end_io -- gets called). Recomputing nr_blocks from
+	 * bio->bi_iter.bi_size at completion time therefore always yields 0,
+	 * which silently drops every f2fs_zns_swap_track_complete() release
+	 * and leaks that zone's in-flight count forever. Use this saved
+	 * value instead.
+	 */
+	unsigned int nr_blocks;
 	struct work_struct work;
 	struct page *node_page;
 };
@@ -3776,6 +3792,40 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 			struct f2fs_io_info *fio, bool defer_sit);
 void f2fs_zns_swap_commit_block(struct f2fs_sb_info *sbi, block_t old_blkaddr,
 		block_t new_blkaddr);
+void f2fs_zns_swap_track_alloc(struct f2fs_sb_info *sbi, int type,
+		block_t blkaddr);
+void f2fs_zns_swap_track_complete(struct f2fs_sb_info *sbi, int type,
+		block_t blkaddr, int nr_blocks);
+/* DIAGNOSTIC: see struct f2fs_zns_zone_track's submitted_bitmap. */
+void f2fs_zns_swap_track_submitted(struct f2fs_sb_info *sbi, int type,
+		block_t blkaddr, int nr_blocks);
+
+/*
+ * Per-write() bookkeeping for f2fs_zns_swap_track_alloc(): a single
+ * f2fs_swap_rw() write() can allocate several blocks (one
+ * f2fs_zns_swap_track_alloc() call each, all synchronously on this same
+ * task's stack) before iomap ever gets around to actually submitting a bio
+ * for them. If iomap gives up on part of the extent -- e.g.
+ * bio_iov_iter_get_pages() failing under memory pressure -- those trailing
+ * blocks are allocated (and counted in-flight) but will never be submitted,
+ * so no completion will ever arrive to release them, permanently leaking
+ * that count and blocking the zone's ZONE_FINISH forever. current->journal_info
+ * (unused by f2fs otherwise) carries one of these for the duration of a
+ * single f2fs_swap_rw() write call so the tracked count can be reconciled
+ * against how many blocks iomap actually reports as written, and the
+ * trailing gap (if any) rolled back. See f2fs_zns_swap_track_alloc_ctx_*()
+ * in segment.c.
+ */
+struct f2fs_zns_swap_alloc_ctx {
+	unsigned int magic;		/* guards against misinterpreting an
+					 * unrelated journal_info user */
+	unsigned int count;		/* # of track_alloc() calls seen so far */
+	block_t last_blkaddr;		/* blkaddr of the most recent one */
+};
+
+void f2fs_zns_swap_track_alloc_ctx_begin(struct f2fs_zns_swap_alloc_ctx *ctx);
+void f2fs_zns_swap_track_alloc_ctx_end(struct f2fs_sb_info *sbi,
+		struct f2fs_zns_swap_alloc_ctx *ctx, loff_t bytes_written);
 void f2fs_update_device_state(struct f2fs_sb_info *sbi, nid_t ino,
 					block_t blkaddr, unsigned int blkcnt);
 void f2fs_wait_on_page_writeback(struct page *page,
