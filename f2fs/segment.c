@@ -2053,6 +2053,15 @@ static int __f2fs_issue_discard_zone(struct f2fs_sb_info *sbi,
 static int __issue_discard_async(struct f2fs_sb_info *sbi,
 		struct block_device *bdev, block_t blkstart, block_t blklen)
 {
+	/* --- CXL DAX NATIVE MOD: 攔截 NULL bdev --- */
+	/* * CXL DAX 模式下 sb->s_bdev 為 NULL，f2fs_target_device() 會把
+	 * NULL 傳進來。CXL 是記憶體直連，沒有 discard/TRIM 的概念，
+	 * 直接回傳 0 (成功)，避免 bdev_is_zoned() 解參考 NULL 指標。
+	 */
+	if (sbi->is_cxl_dax && !bdev)
+		return 0;
+	/* ----------------------------------------- */
+
 #ifdef CONFIG_BLK_DEV_ZONED
 	if (f2fs_sb_has_blkzoned(sbi) && bdev_is_zoned(bdev))
 		return __f2fs_issue_discard_zone(sbi, bdev, blkstart, blklen);

@@ -4356,7 +4356,7 @@ static int f2fs_swap_rw(struct kiocb *iocb, struct iov_iter *iter)
 	const char *rw_str = (iov_iter_rw(iter) == WRITE) ? "WRITE" : "READ";
 	loff_t pos = iocb->ki_pos;
 	size_t count = iov_iter_count(iter);
-	int ret;
+	ssize_t ret;
 
 #ifdef CONFIG_F2FS_SWAP_DEBUG
 	f2fs_info(sbi,
@@ -4394,12 +4394,12 @@ static int f2fs_swap_rw(struct kiocb *iocb, struct iov_iter *iter)
 
 		if (ret < 0 && ret != -EIOCBQUEUED) {
 			f2fs_err(sbi,
-				"swap_rw: WRITE FAILED inode=%lu pos_in=%lld count=%zu ret=%d",
+				"swap_rw: WRITE FAILED inode=%lu pos_in=%lld count=%zu ret=%zd",
 				inode->i_ino, pos, count, ret);
 		} else {
 #ifdef CONFIG_F2FS_SWAP_DEBUG
 			f2fs_info(sbi,
-				"swap_rw: WRITE %s inode=%lu pos_in=%lld bytes=%d new_pos=%lld",
+				"swap_rw: WRITE %s inode=%lu pos_in=%lld bytes=%zd new_pos=%lld",
 				(ret == -EIOCBQUEUED) ? "QUEUED" : "OK",
 				inode->i_ino, pos, ret, iocb->ki_pos);
 #endif
@@ -4416,18 +4416,33 @@ static int f2fs_swap_rw(struct kiocb *iocb, struct iov_iter *iter)
 
 		if (ret < 0 && ret != -EIOCBQUEUED) {
 			f2fs_err(sbi,
-				"swap_rw: READ FAILED inode=%lu pos_in=%lld count=%zu ret=%d",
+				"swap_rw: READ FAILED inode=%lu pos_in=%lld count=%zu ret=%zd",
 				inode->i_ino, pos, count, ret);
 		} else {
 #ifdef CONFIG_F2FS_SWAP_DEBUG
 			f2fs_info(sbi,
-				"swap_rw: READ %s inode=%lu pos_in=%lld bytes=%d new_pos=%lld",
+				"swap_rw: READ %s inode=%lu pos_in=%lld bytes=%zd new_pos=%lld",
 				(ret == -EIOCBQUEUED) ? "QUEUED" : "OK",
 				inode->i_ino, pos, ret, iocb->ki_pos);
 #endif
 		}
 	}
 
+	/* --- CXL/ZNS SWAP MOD: swap_rw 的介面契約 ---
+	 * mm/page_io.c 的 sio_write_complete() / sio_read_complete() 判斷成功的
+	 * 條件是 "ret == sio->len"，也就是必須回傳「實際傳輸的位元組數」，
+	 * 不是回傳 0。
+	 *
+	 * (fs/nfs/direct.c 的 nfs_swap_rw() 成功時回傳 0，那是因為 NFS 用
+	 *  VM_BUG_ON 限制自己只做單頁 PAGE_SIZE I/O；我們這條路徑會被
+	 *  swap_write_unplug() 以多頁批次 (最大 128KB) 呼叫，結果會直接送進
+	 *  sio_write_complete()，回傳 0 會讓每一次成功的寫入都被誤判成失敗
+	 *  "Write error 0 on dio swapfile"，page 被重新標記 dirty 而無法換出。)
+	 *
+	 * 因此成功時原樣回傳 bytes 數，-EIOCBQUEUED 原樣傳遞，錯誤回傳負值。
+	 * short write 不在此另行攔截 —— 上層 ret != sio->len 的比較已經涵蓋，
+	 * 且會做正確的 retry (重新標記 dirty)，比我們回傳 -EIO 更保守。
+	 */
 	return ret;
 }
 #else

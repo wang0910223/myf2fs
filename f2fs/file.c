@@ -4519,7 +4519,27 @@ static ssize_t f2fs_write_checks(struct kiocb *iocb, struct iov_iter *from)
 	if (unlikely(is_swap))
 		inode->i_flags &= ~S_SWAPFILE;
 
-	count = generic_write_checks(iocb, from);
+	/* --- CXL/ZNS SWAP MOD: swapfile 寫入繞過 RLIMIT_FSIZE ---
+	 * swap I/O 由 kswapd / direct reclaim 發出，繼承的是當初呼叫
+	 * swapon 那個 process 的 rlimit。若該 rlimit 小於 swapfile 大小，
+	 * generic_write_checks() 會對所有超過界限的 offset 回傳 -EFBIG，
+	 * 導致 page 換不出去 (Write error -27 on dio swapfile)。
+	 * swap 路徑不該受 RLIMIT_FSIZE 約束，所以改用 generic_write_checks_count()
+	 * 只做範圍/s_maxbytes 檢查，跳過 rlimit。
+	 */
+	if (unlikely(is_swap)) {
+		count = iov_iter_count(from);
+		if (iocb->ki_pos >= inode->i_sb->s_maxbytes) {
+			count = -EFBIG;
+		} else {
+			if (count > inode->i_sb->s_maxbytes - iocb->ki_pos)
+				count = inode->i_sb->s_maxbytes - iocb->ki_pos;
+			iov_iter_truncate(from, count);
+		}
+	} else {
+		count = generic_write_checks(iocb, from);
+	}
+	/* -------------------------------------------------------- */
 
 	if (unlikely(is_swap))
 		inode->i_flags |= S_SWAPFILE;
@@ -4527,9 +4547,14 @@ static ssize_t f2fs_write_checks(struct kiocb *iocb, struct iov_iter *from)
 	if (count <= 0)
 		return count;
 
-	err = file_modified(file);
-	if (err)
-		return err;
+	/* swapfile 的 mtime/ctime 與 suid 清除無意義，且 file_modified()
+	 * 會觸發額外的 journal 寫入；swap 路徑直接跳過。
+	 */
+	if (likely(!is_swap)) {
+		err = file_modified(file);
+		if (err)
+			return err;
+	}
 	return count;
 }
 
