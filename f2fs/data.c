@@ -1773,6 +1773,23 @@ int f2fs_map_blocks(struct inode *inode, struct f2fs_map_blocks *map, int flag)
 	unsigned int start_pgofs;
 	int bidx = 0;
 	bool is_hole;
+	/*
+	 * Set when this iteration of the next_block loop allocated a brand new
+	 * physical block for pgofs (the F2FS_GET_BLOCK_DIO/PRE_DIO case below).
+	 * The checks further down can still decide not to include that block in
+	 * this mapping (e.g. it isn't physically contiguous with the ones
+	 * already in map->m_len, which under LFS/ZONE_APPEND happens every time
+	 * allocation crosses into a new segment) and bail out via sync_out. In
+	 * that case the block is simply dropped: iomap never learns about it,
+	 * never builds a bio for it, and re-maps that same logical offset on its
+	 * next iteration, getting a fresh block. For ZNS swap writes that means
+	 * the dropped block's f2fs_zns_swap_track_alloc() in-flight count would
+	 * never be released by any completion, permanently pinning its zone open
+	 * (it can then never reach ZONE_FINISH, and the device eventually
+	 * refuses new writes with "active zones exceeded"). So we hand the count
+	 * back at the point of dropping it -- see the sync_out label.
+	 */
+	bool just_allocated = false;
 
 	if (!maxblocks)
 		return 0;
@@ -1847,6 +1864,7 @@ next_block:
 			err = __allocate_data_block(&dn, map->m_seg_type);
 			if (err)
 				goto sync_out;
+			just_allocated = true;
 			if (flag == F2FS_GET_BLOCK_PRE_DIO)
 				file_need_truncate(inode);
 			set_inode_flag(inode, FI_APPEND_WRITE);
@@ -1948,6 +1966,12 @@ next_block:
 	}
 
 skip:
+	/*
+	 * Reaching here means the block was either folded into map->m_len
+	 * above, or didn't need allocating at all -- either way it is no
+	 * longer at risk of being silently dropped by a later sync_out.
+	 */
+	just_allocated = false;
 	dn.ofs_in_node++;
 	pgofs++;
 
@@ -2002,6 +2026,19 @@ skip:
 	goto next_dnode;
 
 sync_out:
+#ifdef CONFIG_BLK_DEV_ZONED
+	/*
+	 * We allocated a physical block for pgofs but are bailing out without
+	 * including it in this mapping, so nothing will ever write to it and no
+	 * completion will ever release the in-flight count that
+	 * f2fs_zns_swap_track_alloc() took for it. Release it here instead --
+	 * see the just_allocated declaration for why this matters. (blkaddr is
+	 * that block's address; dn.data_blkaddr holds the same value.)
+	 */
+	if (just_allocated && sbi->is_cxl_dax && f2fs_sb_has_blkzoned(sbi) &&
+			f2fs_lfs_mode(sbi) && IS_SWAPFILE(inode))
+		f2fs_zns_swap_track_complete(sbi, map->m_seg_type, blkaddr, 1);
+#endif
 
 	if (flag == F2FS_GET_BLOCK_DIO && map->m_flags & F2FS_MAP_MAPPED) {
 		/*
@@ -4456,12 +4493,25 @@ static int f2fs_swap_rw(struct kiocb *iocb, struct iov_iter *iter)
 
 		if (f2fs_sb_has_blkzoned(sbi)) {
 			struct iomap_dio *dio;
+			struct f2fs_zns_swap_alloc_ctx alloc_ctx;
 
 			/* Defensive programming: check for checkpoint error */
 			if (unlikely(f2fs_cp_error(sbi))) {
 				ret = -EIO;
 				goto out;
 			}
+
+			/*
+			 * Track how many blocks f2fs_zns_swap_track_alloc()
+			 * counts as in-flight during this write(), so any
+			 * trailing gap between that and what iomap actually
+			 * submits (e.g. bio_iov_iter_get_pages() failing
+			 * partway through under memory pressure) can be
+			 * rolled back below instead of leaking those zones'
+			 * in-flight counts forever. See struct
+			 * f2fs_zns_swap_alloc_ctx.
+			 */
+			f2fs_zns_swap_track_alloc_ctx_begin(&alloc_ctx);
 
 			/* 
 			 * BYPASS f2fs_file_write_iter() and inode_lock() entirely!
@@ -4476,6 +4526,22 @@ static int f2fs_swap_rw(struct kiocb *iocb, struct iov_iter *iter)
 				ret = PTR_ERR_OR_ZERO(dio);
 			else
 				ret = iomap_dio_complete(dio);
+
+			/*
+			 * ret == -EIOCBQUEUED means this write's completion is
+			 * still pending elsewhere (async DIO) -- we don't yet
+			 * know its final byte count, so reconciling now would
+			 * misfire. This path bypasses f2fs_file_write_iter()
+			 * and is always driven with a synchronous kiocb (see
+			 * comment above), so this should not happen in
+			 * practice, but skip reconciliation rather than risk
+			 * an incorrect rollback if it ever does.
+			 */
+			if (ret != -EIOCBQUEUED)
+				f2fs_zns_swap_track_alloc_ctx_end(sbi,
+						&alloc_ctx, ret);
+			else
+				current->journal_info = NULL;
 		} else {
 			ret = f2fs_file_write_iter(iocb, iter);
 		}
