@@ -1342,8 +1342,6 @@ static bool __need_flush_quota(struct f2fs_sb_info *sbi)
 /*
  * Freeze all the FS-operations for checkpoint.
  */
-#define F2FS_CXL_BLOCK_OPS_MAX_RETRY 1000
-
 static int block_operations(struct f2fs_sb_info *sbi)
 {
 	struct writeback_control wbc = {
@@ -1352,8 +1350,33 @@ static int block_operations(struct f2fs_sb_info *sbi)
 		.for_reclaim = 0,
 	};
 	int err = 0, cnt = 0;
-	unsigned int node_retry_cnt = 0;
-	unsigned int dents_retry_cnt = 0;
+
+	/*
+	 * CXL DAX MOD: umount 時直接放棄所有髒頁回寫。
+	 * DAX 路徑的髒頁計數永遠不會歸零（寫入走同步 memcpy，繞過了
+	 * I/O 完成時的 dec_page_count），原本的重試迴圈會永遠轉下去。
+	 * 實驗環境不在乎資料完整性，卸載時直接清帳走人。
+	 */
+	if (is_sbi_flag_set(sbi, SBI_IS_CLOSE)) {
+		f2fs_warn(sbi, "F2FS-CXL: umount in progress, skipping dirty page flush "
+			"(dents=%lld imeta=%lld nodes=%lld)",
+			get_pages(sbi, F2FS_DIRTY_DENTS),
+			get_pages(sbi, F2FS_DIRTY_IMETA),
+			get_pages(sbi, F2FS_DIRTY_NODES));
+
+		while (get_pages(sbi, F2FS_DIRTY_DENTS) > 0)
+			dec_page_count(sbi, F2FS_DIRTY_DENTS);
+		while (get_pages(sbi, F2FS_DIRTY_IMETA) > 0)
+			dec_page_count(sbi, F2FS_DIRTY_IMETA);
+		while (get_pages(sbi, F2FS_DIRTY_NODES) > 0)
+			dec_page_count(sbi, F2FS_DIRTY_NODES);
+
+		f2fs_lock_all(sbi);
+		f2fs_down_write(&sbi->node_change);
+		__prepare_cp_block(sbi);
+		f2fs_up_write(&sbi->node_change);
+		return 0;
+	}
 
 	/*
 	 * Let's flush inline_data in dirty node pages.
@@ -1384,17 +1407,6 @@ retry_flush_quotas:
 retry_flush_dents:
 	/* write all the dirty dentry pages */
 	if (get_pages(sbi, F2FS_DIRTY_DENTS)) {
-		/* CXL DAX MOD: 活鎖保險絲 — dents 髒頁計數卡住時強制歸零 */
-		if (unlikely(++dents_retry_cnt > F2FS_CXL_BLOCK_OPS_MAX_RETRY)) {
-			f2fs_warn(sbi, "F2FS-CXL: block_operations dents flush "
-				"exceeded %d retries, force clearing "
-				"F2FS_DIRTY_DENTS to unblock umount/checkpoint",
-				F2FS_CXL_BLOCK_OPS_MAX_RETRY);
-			while (get_pages(sbi, F2FS_DIRTY_DENTS) > 0)
-				dec_page_count(sbi, F2FS_DIRTY_DENTS);
-			goto retry_flush_dents;
-		}
-
 		f2fs_unlock_all(sbi);
 		err = f2fs_sync_dirty_inodes(sbi, DIR_INODE, true);
 		if (err)
@@ -1423,27 +1435,6 @@ retry_flush_nodes:
 	f2fs_down_write(&sbi->node_write);
 
 	if (get_pages(sbi, F2FS_DIRTY_NODES)) {
-		/* ========================================================= */
-		/* CXL DAX MOD: 活鎖保險絲 — node 髒頁計數卡住時強制歸零 */
-		/* 避免 umount/checkpoint 因為 DAX 寫入路徑漏算而無限重試 */
-		/* ========================================================= */
-		if (unlikely(++node_retry_cnt > F2FS_CXL_BLOCK_OPS_MAX_RETRY)) {
-			unsigned int stuck = get_pages(sbi, F2FS_DIRTY_NODES);
-
-			f2fs_warn(sbi, "F2FS-CXL: block_operations node flush "
-				"exceeded %d retries (stuck=%u), force clearing "
-				"F2FS_DIRTY_NODES to unblock umount/checkpoint",
-				F2FS_CXL_BLOCK_OPS_MAX_RETRY, stuck);
-
-			while (get_pages(sbi, F2FS_DIRTY_NODES) > 0)
-				dec_page_count(sbi, F2FS_DIRTY_NODES);
-
-			f2fs_up_write(&sbi->node_write);
-			__prepare_cp_block(sbi);
-			f2fs_up_write(&sbi->node_change);
-			return err;
-		}
-
 		f2fs_up_write(&sbi->node_write);
 		atomic_inc(&sbi->wb_sync_req[NODE]);
 		err = f2fs_sync_node_pages(sbi, &wbc, false, FS_CP_NODE_IO);
