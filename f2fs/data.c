@@ -4392,6 +4392,20 @@ static int f2fs_swap_rw(struct kiocb *iocb, struct iov_iter *iter)
 
 		ret = f2fs_file_write_iter(iocb, iter);
 
+		/* --- CXL/ZNS SWAP MOD: 攔截「靜默的 0 / short write」---
+		 * f2fs_dio_write_iter() 在 DIO 放棄時 (-ENOTBLK / partial) 可能
+		 * 回傳 0 或小於要求量的值，交由 caller 做 buffered fallback。
+		 * swap 路徑沒有 fallback，回傳 0 只會讓上層印出
+		 * "Write error 0 on dio swapfile" 並重新標記 dirty，看起來像
+		 * 成功卻其實什麼都沒寫。這裡明確轉成 -EIO 讓 swap 層重試。
+		 */
+		if (ret >= 0 && (size_t)ret != count) {
+			f2fs_err(sbi,
+				"swap_rw: WRITE SHORT inode=%lu pos_in=%lld expected=%zu got=%zd -> -EIO",
+				inode->i_ino, pos, count, ret);
+			ret = -EIO;
+		}
+
 		if (ret < 0 && ret != -EIOCBQUEUED) {
 			f2fs_err(sbi,
 				"swap_rw: WRITE FAILED inode=%lu pos_in=%lld count=%zu ret=%zd",

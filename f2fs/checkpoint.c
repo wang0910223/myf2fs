@@ -1301,6 +1301,33 @@ static int block_operations(struct f2fs_sb_info *sbi)
 	int err = 0, cnt = 0;
 
 	/*
+	 * CXL DAX MOD: umount 時直接放棄所有髒頁回寫。
+	 * DAX 路徑的髒頁計數永遠不會歸零（寫入走同步 memcpy，繞過了
+	 * I/O 完成時的 dec_page_count），原本的重試迴圈會永遠轉下去。
+	 * 實驗環境不在乎資料完整性，卸載時直接清帳走人。
+	 */
+	if (is_sbi_flag_set(sbi, SBI_IS_CLOSE)) {
+		f2fs_warn(sbi, "F2FS-CXL: umount in progress, skipping dirty page flush "
+			"(dents=%lld imeta=%lld nodes=%lld)",
+			get_pages(sbi, F2FS_DIRTY_DENTS),
+			get_pages(sbi, F2FS_DIRTY_IMETA),
+			get_pages(sbi, F2FS_DIRTY_NODES));
+
+		while (get_pages(sbi, F2FS_DIRTY_DENTS) > 0)
+			dec_page_count(sbi, F2FS_DIRTY_DENTS);
+		while (get_pages(sbi, F2FS_DIRTY_IMETA) > 0)
+			dec_page_count(sbi, F2FS_DIRTY_IMETA);
+		while (get_pages(sbi, F2FS_DIRTY_NODES) > 0)
+			dec_page_count(sbi, F2FS_DIRTY_NODES);
+
+		f2fs_lock_all(sbi);
+		f2fs_down_write(&sbi->node_change);
+		__prepare_cp_block(sbi);
+		f2fs_up_write(&sbi->node_change);
+		return 0;
+	}
+
+	/*
 	 * Let's flush inline_data in dirty node pages.
 	 */
 	f2fs_flush_inline_data(sbi);

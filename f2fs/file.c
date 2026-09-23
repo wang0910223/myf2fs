@@ -4739,7 +4739,19 @@ static ssize_t f2fs_dio_write_iter(struct kiocb *iocb, struct iov_iter *from,
 			     &f2fs_iomap_dio_write_ops, dio_flags, NULL, 0);
 	if (IS_ERR_OR_NULL(dio)) {
 		ret = PTR_ERR_OR_ZERO(dio);
-		if (ret == -ENOTBLK)
+		/* --- CXL/ZNS SWAP MOD: swap 路徑不可把 -ENOTBLK 吞成 0 ---
+		 * -ENOTBLK 的語意是「DIO 放棄，請 caller 改走 buffered write」。
+		 * 一般檔案會在下面 iov_iter_count(from) != 0 的分支做 fallback，
+		 * 但 swap 路徑由 f2fs_swap_rw() 進入，上層 sio_write_complete()
+		 * 只看 "ret == sio->len"，回傳 0 會被判定成失敗
+		 * ("Write error 0 on dio swapfile")，page 重新標記 dirty。
+		 *
+		 * 多執行緒時 kiocb_invalidate_pages() 失敗機率大幅上升
+		 * (另一個 thread 正好持有同範圍的 page)，所以 -j8 才看得到、
+		 * single thread 看不到。這裡把錯誤如實往上傳，讓 swap 層自己
+		 * 重試 —— 這是最保守的處理，不會遺失資料。
+		 */
+		if (ret == -ENOTBLK && !IS_SWAPFILE(inode))
 			ret = 0;
 		if (ret != -EIOCBQUEUED)
 			dec_page_count(sbi, F2FS_DIO_WRITE);
