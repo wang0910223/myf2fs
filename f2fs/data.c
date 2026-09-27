@@ -4472,10 +4472,18 @@ static int f2fs_swap_rw(struct kiocb *iocb, struct iov_iter *iter)
 	}
 
 	if (iov_iter_rw(iter) == WRITE) {
-		iocb->ki_flags |= IOCB_DIRECT | IOCB_DSYNC;
+		/*
+		 * No IOCB_DSYNC: swap contents are discarded on reboot, so the
+		 * per-write fdatasync buys nothing. With async ZONE_APPEND it ran
+		 * from iomap_dio_complete_work (no PF_MEMALLOC), and its GFP_NOFS
+		 * allocations entered direct reclaim, which allocates swap slots
+		 * but cannot write to an SWP_FS_OPS swapfile. The swapfile's
+		 * dirty node pages are written at checkpoint instead.
+		 */
+		iocb->ki_flags |= IOCB_DIRECT;
 #ifdef CONFIG_F2FS_SWAP_DEBUG
 		f2fs_info(sbi,
-			"swap_rw: WRITE(direct+dsync) -> f2fs_file_write_iter "
+			"swap_rw: WRITE(direct) -> f2fs_file_write_iter "
 			"inode=%lu pos=%lld count=%zu",
 			inode->i_ino, iocb->ki_pos, count);
 #endif
